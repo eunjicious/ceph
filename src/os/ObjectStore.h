@@ -434,6 +434,16 @@ public:
       __le32 split_bits;                //OP_SPLIT_COLLECTION2,OP_COLL_SET_BITS,
                                         //OP_MKCOLL
       __le32 split_rem;                 //OP_SPLIT_COLLECTION2
+//EUNJI
+      __le32 punch_hole_off;		//OP_WRITE
+
+      void encode(bufferlist &bl) const {
+        bl.append((char*)this, sizeof(Op));
+      }
+      void decode(bufferlist::iterator &bl){
+        bl.copy(sizeof(Op), (char*)this);
+      }
+
     } __attribute__ ((packed)) ;
 
     struct TransactionData {
@@ -499,10 +509,43 @@ public:
     __le32 coll_id {0};
     __le32 object_id {0};
 
+  // EUNJI : 나중에 바꿔야지.. 
+  public:
     bufferlist data_bl;
+    // EUNJI 
+    //bufferlist meta_data_bl; // 이건 왜 둔거지? 
     bufferlist op_bl;
 
     bufferptr op_ptr;
+
+    // EUNJI
+    vector<Op> punch_hole_ops;
+    struct iov_t {
+      string fname;
+      uint64_t foff;
+      uint64_t bytes;
+      //uint64_t tot_bytes;
+      
+      void encode(bufferlist& bl) const {
+        bl.append((char*)this, sizeof(iov_t));
+      }
+
+      void decode(bufferlist::iterator& bl){
+        bl.copy(sizeof(iov_t), (char*)this);
+      }
+
+      iov_t(const string& fname_, uint64_t foff_, uint64_t bytes_ ) : 
+	fname(fname_),
+	foff(foff_),
+	bytes(bytes_)
+      {}
+
+
+      iov_t(){}
+      ~iov_t(){}
+    };
+    map<uint64_t, vector<iov_t>> punch_hole_map; // offset, iov  
+
 
     list<Context *> on_applied;
     list<Context *> on_commit;
@@ -528,8 +571,14 @@ public:
       coll_id(other.coll_id),
       object_id(other.object_id),
       data_bl(std::move(other.data_bl)),
+      // EUNJI
+      //meta_data_bl(std::move(other.meta_data_bl)),
       op_bl(std::move(other.op_bl)),
       op_ptr(std::move(other.op_ptr)),
+      // EUNJI
+      punch_hole_ops(std::move(other.punch_hole_ops)),
+      punch_hole_map(std::move(other.punch_hole_map)),  
+
       on_applied(std::move(other.on_applied)),
       on_commit(std::move(other.on_commit)),
       on_applied_sync(std::move(other.on_applied_sync)) {
@@ -546,8 +595,14 @@ public:
       coll_id = other.coll_id;
       object_id = other.object_id;
       data_bl = std::move(other.data_bl);
+      // EUNJI
+      //meta_data_bl = std::move(other.meta_data_bl);
       op_bl = std::move(other.op_bl);
       op_ptr = std::move(other.op_ptr);
+      // EUNJI
+      punch_hole_ops = std::move(other.punch_hole_ops);
+      punch_hole_map = std::move(other.punch_hole_map);  
+
       on_applied = std::move(other.on_applied);
       on_commit = std::move(other.on_commit);
       on_applied_sync = std::move(other.on_applied_sync);
@@ -631,6 +686,7 @@ public:
       std::swap(object_id, other.object_id);
       op_bl.swap(other.op_bl);
       data_bl.swap(other.data_bl);
+      //meta_data_bl.swap(other.meta_data_bl);
     }
 
     void _update_op(Op* op,
@@ -747,12 +803,20 @@ public:
     /// Append the operations of the parameter to this Transaction. Those operations are removed from the parameter Transaction
     void append(Transaction& other) {
 
+      std::cout << "[EUNJI] append " << std::endl;
+
       data.ops += other.data.ops;
       if (other.data.largest_data_len > data.largest_data_len) {
 	data.largest_data_len = other.data.largest_data_len;
 	data.largest_data_off = other.data.largest_data_off;
 	data.largest_data_off_in_data_bl = data_bl.length() + other.data.largest_data_off_in_data_bl;
       }
+
+      std::cout << "[EUNJI] data.largest_data_len = " << data.largest_data_len << " " << std::endl;
+      std::cout << "[EUNJI] data.largest_data_off = " << data.largest_data_off << " " << std::endl;
+      std::cout << "[EUNJI] data.largest_data_off_in_data_bl = " << data.largest_data_off_in_data_bl << " " << std::endl;
+
+
       data.fadvise_flags |= other.data.fadvise_flags;
       on_applied.splice(on_applied.end(), other.on_applied);
       on_commit.splice(on_commit.end(), other.on_commit);
@@ -792,6 +856,8 @@ public:
       op_bl.append(other_op_bl);
       //append data_bl
       data_bl.append(other.data_bl);
+      // EUNJI append meta_data_bl
+      //meta_data_bl.append(other.meta_data_bl);
     }
 
     /** Inquires about the Transaction as a whole. */
@@ -886,14 +952,15 @@ public:
      *
      */
     class iterator {
+    public: // EUNJI. debugging. 
       Transaction *t;
 
       uint64_t ops;
       char* op_buffer_p;
-
+    
       bufferlist::iterator data_bl_p;
 
-    public:
+    //public:
       vector<coll_t> colls;
       vector<ghobject_t> objects;
 
@@ -1070,6 +1137,12 @@ public:
       _op->oid = _get_object_id(oid);
       _op->off = off;
       _op->len = len;
+    //EUNJI: offset data in data_bl
+      // offset 이니까 1 안더하고 그냥 length 쓰면 되는듯. 
+      _op->punch_hole_off = orig_len;
+      punch_hole_ops.push_back((*_op));
+      assert(punch_hole_ops.size() > 0);
+
       ::encode(write_data, data_bl);
 
       assert(len == write_data.length());
@@ -1450,6 +1523,70 @@ public:
 
       DECODE_FINISH(bl);
     }
+
+//#ifdef EUNJI
+    void encode_punch_hole(bufferlist& bl) const {
+      //layout: data_bl + op_bl + coll_index + object_index + data
+      ENCODE_START(9, 9, bl);
+      //::encode(data_bl, bl);
+      //::encode(meta_data_bl, bl);
+      // 기존에도 한번은 encode 를 함. encode 할때 새로운 tbl로 copy 가 일어남. 
+      // meta 정보만 들고 있다가 새로운 tbl 에 바로 encode 하자.
+      // 그러면 추가적인 memory copy 안들어감. 
+
+      ::encode(punch_hole_ops, bl);
+      ::encode(punch_hole_map, bl);
+
+      uint32_t coff = 0;
+      for(vector<Op>::const_iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); iter++)
+      {	
+	bufferlist log_data;
+	log_data.substr_of(data_bl, coff, (*iter).punch_hole_off - coff);
+
+	::encode_destructively(log_data, bl);
+	coff += ((*iter).len + sizeof(__u32));	
+      }
+      bufferlist log_data;
+      log_data.substr_of(data_bl, coff, data_bl.length() - coff);
+      ::encode_destructively(log_data, bl);
+
+      ::encode(op_bl, bl);
+      ::encode(coll_index, bl);
+      ::encode(object_index, bl);
+      data.encode(bl);
+      ENCODE_FINISH(bl);
+    }
+
+    void decode_punch_hole(bufferlist::iterator &bl) {
+      DECODE_START(9, bl);
+      DECODE_OLDEST(9);
+      
+      //::decode(data_bl, bl);
+      ::decode(punch_hole_ops, bl);
+      ::decode(punch_hole_map, bl);
+
+      for(vector<Op>::iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); ++iter)
+      {	
+	::decode(data_bl, bl);
+    
+	// fill out punch 
+	// hole 은 zero 를 만들어서 붙이든가 해야함.. 
+	// 여기서 원래는 punch_hole_map 보고 해당하는 file 읽어와서 replay 해야함. 
+	// 일단은 zero 로 두자. 
+	data_bl.append_zero((*iter).len);
+      }
+      ::decode(data_bl, bl);
+
+      ::decode(op_bl, bl);
+      ::decode(coll_index, bl);
+      ::decode(object_index, bl);
+      data.decode(bl);
+      coll_id = coll_index.size();
+      object_id = object_index.size();
+
+      DECODE_FINISH(bl);
+    }
+//#endif
 
     void dump(ceph::Formatter *f);
     static void generate_test_instances(list<Transaction*>& o);
@@ -2011,6 +2148,10 @@ public:
 };
 WRITE_CLASS_ENCODER(ObjectStore::Transaction)
 WRITE_CLASS_ENCODER(ObjectStore::Transaction::TransactionData)
+// EUNJI
+WRITE_CLASS_ENCODER(ObjectStore::Transaction::Op)
+WRITE_CLASS_ENCODER(ObjectStore::Transaction::iov_t)
+
 
 static inline void intrusive_ptr_add_ref(ObjectStore::Sequencer_impl *s) {
   s->get();

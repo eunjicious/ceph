@@ -20,6 +20,7 @@
 
 #include "filestore/FileStore.h"
 #include "memstore/MemStore.h"
+#include "buddystore/BuddyStore.h"
 #if defined(HAVE_LIBAIO)
 #include "bluestore/BlueStore.h"
 #endif
@@ -72,6 +73,13 @@ ObjectStore *ObjectStore::create(CephContext *cct,
   if (type == "memstore") {
     return new MemStore(cct, data);
   }
+  // EUNJI
+  if (type == "buddystore") {
+    return new BuddyStore(cct, data, flags);
+  }
+//  if (type == "buddystore") {
+//    return new BuddyStore(cct, data);
+//  }
 #if defined(HAVE_LIBAIO)
   if (type == "bluestore" &&
       cct->check_experimental_feature_enabled("bluestore")) {

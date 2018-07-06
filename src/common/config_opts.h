@@ -998,6 +998,10 @@ OPTION(memstore_device_bytes, OPT_U64, 1024*1024*1024)
 OPTION(memstore_page_set, OPT_BOOL, true)
 OPTION(memstore_page_size, OPT_U64, 64 << 10)
 
+OPTION(buddystore_device_bytes, OPT_U64, 1024*1024*1024)
+OPTION(buddystore_page_set, OPT_BOOL, true)
+OPTION(buddystore_page_size, OPT_U64, 64 << 10)
+
 OPTION(bdev_debug_inflight_ios, OPT_BOOL, false)
 OPTION(bdev_inject_crash, OPT_INT, 0)  // if N>0, then ~ 1/N IOs will complete before we crash on flush.
 OPTION(bdev_inject_crash_flush_delay, OPT_INT, 2) // wait N more seconds on flush
@@ -1317,6 +1321,18 @@ OPTION(journal_replay_from, OPT_INT, 0)
 OPTION(journal_zero_on_create, OPT_BOOL, false)
 OPTION(journal_ignore_corruption, OPT_BOOL, false) // assume journal is not corrupt
 OPTION(journal_discard, OPT_BOOL, false) //using ssd disk as journal, whether support discard nouse journal-data.
+
+// EUNJI
+OPTION(buddystore_data_directio, OPT_BOOL, true)
+OPTION(buddystore_data_flush, OPT_BOOL, true)
+OPTION(buddystore_data_sync, OPT_BOOL, true)
+OPTION(buddystore_data_hold_in_memory, OPT_BOOL, true)
+OPTION(buddystore_file_prewrite_unit, OPT_LONGLONG, 1 << 20) // 1MB 
+OPTION(buddystore_file_prewrite, OPT_BOOL, true)
+OPTION(buddystore_file_inplace_write, OPT_BOOL, true)
+OPTION(buddystore_index_sync_inerval, OPT_DOUBLE, 10.0)
+OPTION(buddystore_op_threads, OPT_INT, 2)
+OPTION(buddystore_op_thread_suicide_timeout, OPT_INT, 180)
 
 OPTION(fio_dir, OPT_STR, "/tmp/fio") // fio data directory for fio-objectstore
 

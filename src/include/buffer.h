@@ -1,3 +1,5 @@
+#define EUNJI
+
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
 // vim: ts=8 sw=2 smarttab
 /*
@@ -860,16 +862,26 @@ namespace buffer CEPH_BUFFER_API {
 
     void write_stream(std::ostream &out) const;
     void hexdump(std::ostream &out, bool trailing_newline = true) const;
+#ifdef EUNJI
+    int read_file(const char *fn, uint64_t offset, size_t len, std::string *error);
+#endif
     int read_file(const char *fn, std::string *error);
     ssize_t read_fd(int fd, size_t len);
+#ifdef EUNJI
+    ssize_t read_fd(int fd, uint64_t offset, size_t len);
+#endif
     int read_fd_zero_copy(int fd, size_t len);
     int write_file(const char *fn, int mode=0644);
+#ifdef EUNJI 
+    int write_file(const char *fn, uint64_t offset, int mode=0644);
+#endif
     int write_fd(int fd) const;
     int write_fd(int fd, uint64_t offset) const;
     int write_fd_zero_copy(int fd) const;
     void prepare_iov(std::vector<iovec> *piov) const;
     uint32_t crc32c(uint32_t crc) const;
     void invalidate_crc();
+
   };
 
   /*

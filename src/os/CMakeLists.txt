@@ -21,6 +21,14 @@ set(libos_srcs
   filestore/WBThrottle.cc
   filestore/ZFSFileStoreBackend.cc
   memstore/MemStore.cc
+  buddystore/BuddyStore.cc
+  buddystore/BuddyJournal.cc
+  buddystore/BDJournalingObjectStore.cc
+  buddystore/buddy_types.cc
+  buddystore/BuddyLogDataFileObject.cc
+  #  buddystore/BuddyHashIndexFile.cc
+  #buddystore/BuddyFileStore.cc
+  #buddystore/BitMap.cc
   kstore/KStore.cc
   kstore/kstore_types.cc
   fs/FS.cc

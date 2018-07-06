@@ -2110,8 +2110,7 @@ void buffer::list::decode_base64(buffer::list& e)
   bp.set_length(l);
   push_back(std::move(bp));
 }
-
-  
+ 
 
 int buffer::list::read_file(const char *fn, std::string *error)
 {
@@ -2157,6 +2156,52 @@ int buffer::list::read_file(const char *fn, std::string *error)
   return 0;
 }
 
+#ifdef EUNJI
+int buffer::list::read_file(const char *fn, uint64_t offset, size_t len, std::string *error)
+{
+  int fd = TEMP_FAILURE_RETRY(::open(fn, O_RDONLY));
+  if (fd < 0) {
+    int err = errno;
+    std::ostringstream oss;
+    oss << "can't open " << fn << ": " << cpp_strerror(err);
+    *error = oss.str();
+    return -err;
+  }
+
+  struct stat st;
+  memset(&st, 0, sizeof(st));
+  if (::fstat(fd, &st) < 0) {
+    int err = errno;
+    std::ostringstream oss;
+    oss << "bufferlist::read_file(" << fn << "): stat error: "
+        << cpp_strerror(err);
+    *error = oss.str();
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
+    return -err;
+  }
+
+  ssize_t ret = read_fd(fd, offset, len);
+  if (ret < 0) {
+    std::ostringstream oss;
+    oss << "bufferlist::read_file(" << fn << "): read error:"
+	<< cpp_strerror(ret);
+    *error = oss.str();
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
+    return ret;
+  }
+  else if (ret != st.st_size) {
+    // Premature EOF.
+    // Perhaps the file changed between stat() and read()?
+    std::ostringstream oss;
+    oss << "bufferlist::read_file(" << fn << "): warning: got premature EOF.";
+    *error = oss.str();
+    // not actually an error, but weird
+  }
+  VOID_TEMP_FAILURE_RETRY(::close(fd));
+  return 0;
+}
+#endif
+
 ssize_t buffer::list::read_fd(int fd, size_t len)
 {
   // try zero copy first
@@ -2174,6 +2219,55 @@ ssize_t buffer::list::read_fd(int fd, size_t len)
   return ret;
 }
 
+
+#ifdef EUNJI
+//-------- read_fd with offset ----------
+
+ssize_t buffer::list::read_fd(int fd, uint64_t offset, size_t len)
+{
+  // try zero copy first
+  if (false && read_fd_zero_copy(fd, len) == 0) {
+    // TODO fix callers to not require correct read size, which is not
+    // available for raw_pipe until we actually inspect the data
+    return 0;
+  }
+  bufferptr bp = buffer::create(len);
+  ssize_t ret = safe_pread(fd, (void*)bp.c_str(), len, offset);
+  if (ret >= 0) {
+    bp.set_length(ret);
+    append(std::move(bp));
+  }
+  return ret;
+
+#if 0 // write_fd
+  iovec iov[IOV_MAX];
+
+  std::list<ptr>::const_iterator p = _buffers.begin();
+  uint64_t left_pbrs = _buffers.size();
+  while (left_pbrs) {
+    ssize_t bytes = 0;
+    unsigned iovlen = 0;
+    uint64_t size = MIN(left_pbrs, IOV_MAX);
+    left_pbrs -= size;
+    while (size > 0) {
+      iov[iovlen].iov_base = (void *)p->c_str();
+      iov[iovlen].iov_len = p->length();
+      iovlen++;
+      bytes += p->length();
+      ++p;
+      size--;
+    }
+
+    int r = do_writev(fd, iov, offset, iovlen, bytes);
+    if (r < 0)
+      return r;
+    offset += bytes;
+  }
+  return 0;
+#endif
+}
+#endif //EUNJI
+
 int buffer::list::read_fd_zero_copy(int fd, size_t len)
 {
 #ifdef CEPH_HAVE_SPLICE
@@ -2189,6 +2283,11 @@ int buffer::list::read_fd_zero_copy(int fd, size_t len)
   return -ENOTSUP;
 #endif
 }
+
+
+
+
+
 
 int buffer::list::write_file(const char *fn, int mode)
 {
@@ -2214,6 +2313,35 @@ int buffer::list::write_file(const char *fn, int mode)
   }
   return 0;
 }
+
+#ifdef EUNJI
+/// O_DRECT 는 없네. SYNC 도.. 
+// 필요하면 나중에 추가하기. 
+int buffer::list::write_file(const char *fn, uint64_t offset, int mode)
+{
+  int fd = TEMP_FAILURE_RETRY(::open(fn, O_WRONLY|O_CREAT|O_TRUNC, mode));
+  if (fd < 0) {
+    int err = errno;
+    cerr << "bufferlist::write_file(" << fn << "): failed to open file: "
+	 << cpp_strerror(err) << std::endl;
+    return -err;
+  }
+  int ret = write_fd(fd, offset);
+  if (ret) {
+    cerr << "bufferlist::write_fd(" << fn << "): write_fd error: "
+	 << cpp_strerror(ret) << std::endl;
+    VOID_TEMP_FAILURE_RETRY(::close(fd));
+    return ret;
+  }
+  if (TEMP_FAILURE_RETRY(::close(fd))) {
+    int err = errno;
+    cerr << "bufferlist::write_file(" << fn << "): close error: "
+	 << cpp_strerror(err) << std::endl;
+    return -err;
+  }
+  return 0;
+}
+#endif
 
 static int do_writev(int fd, struct iovec *vec, uint64_t offset, unsigned veclen, unsigned bytes)
 {
