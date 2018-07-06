@@ -1,1 +1,24 @@
-Test for file commit msg 
+
+1. do_cmake.sh modified 
+Change the installation path to replace executables installed by apt-get. 
+To avoid tricky configurations in execution, we create a private apt-get repository 
+and install ceph from it. Then, we replace the modified version of Ceph with it. 
+
+<< 
+cmake -DBOOST_J=$(nproc) "$@" ..
+
+>>
+cmake -DCMAKE_INSTALL_PREFIX:PATH=/usr -DBOOST_J=$(nproc) "$@" ..
+
+
+2. src/CMakeLists.txt modified 
+Debug options are added to attach gdb.
+
+# EUNJI_DEBUG 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native -pipe -ggdb")
+
+# EUNJI_DEBUG
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -pipe -ggdb")
+
+
+

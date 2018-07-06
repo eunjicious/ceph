@@ -29,8 +29,14 @@ if(LINUX)
   add_definitions("-D_GNU_SOURCE")
 endif()
 
+# EUNJI_DEBUG 
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native -pipe -ggdb")
+
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wtype-limits -Wignored-qualifiers -Winit-self")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wpointer-arith -Werror=format-security -fno-strict-aliasing -fsigned-char")
+
+# EUNJI_DEBUG
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -pipe -ggdb")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ftemplate-depth-1024 -Wno-invalid-offsetof")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wnon-virtual-dtor")
