@@ -1255,6 +1255,7 @@ OPTION(filestore_collect_device_partition_information, OPT_BOOL, true)
 // sequential writes are slower, but fragmentation is reduced.
 OPTION(filestore_xfs_extsize, OPT_BOOL, false)
 
+OPTION(filestore_journal_enable, OPT_BOOL, true)
 OPTION(filestore_journal_parallel, OPT_BOOL, false)
 OPTION(filestore_journal_writeahead, OPT_BOOL, false)
 OPTION(filestore_journal_trailing, OPT_BOOL, false)
