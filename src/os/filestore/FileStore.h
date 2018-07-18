@@ -746,6 +746,7 @@ private:
                           const std::set <std::string> &changed) override;
   int set_throttle_params();
   float m_filestore_commit_timeout;
+  bool m_filestore_journal_enable; // EUNJI 
   bool m_filestore_journal_parallel;
   bool m_filestore_journal_trailing;
   bool m_filestore_journal_writeahead;

@@ -549,6 +549,7 @@ FileStore::FileStore(CephContext* cct, const std::string &base,
   logger(NULL),
   read_error_lock("FileStore::read_error_lock"),
   m_filestore_commit_timeout(cct->_conf->filestore_commit_timeout),
+  m_filestore_journal_enable(cct->_conf->filestore_journal_enable ),
   m_filestore_journal_parallel(cct->_conf->filestore_journal_parallel ),
   m_filestore_journal_trailing(cct->_conf->filestore_journal_trailing),
   m_filestore_journal_writeahead(cct->_conf->filestore_journal_writeahead),
@@ -732,6 +733,11 @@ int FileStore::statfs(struct store_statfs_t *buf0)
 
 void FileStore::new_journal()
 {
+  if (!m_filestore_journal_enable) {
+	dout(1) << " FileStore journal is disabled " << dendl;
+	return;
+  }
+
   if (journalpath.length()) {
     dout(10) << "open_journal at " << journalpath << dendl;
     journal = new FileJournal(cct, fsid, &finisher, &sync_cond,
