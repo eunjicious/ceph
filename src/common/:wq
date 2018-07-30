@@ -1314,12 +1314,11 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
   data.finished = 0;
   lock.Unlock();
 
-  int remove_objects = num_objects;
+  int remove_objects;
   int rand_id;
-  std::set<int> occur;
 
   // EUNJI: num_objects to be removed 
-  if (remove_ratio < 100) {
+  if (ratio < 100) {
 	remove_objects = num_objects * (remove_ratio/100.0);
   }
 
@@ -1375,17 +1374,8 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
     lock.Unlock();
 
 ////// EUNJI 
-	while(1){
-	  rand_id = rand() % num_objects;
-	  set<int>::iterator i = occur.find(rand_id);
-	  if(i == occur.end()){ // not occur 
-		occur.insert(rand_id);
-		break;
-	  }
-	}
-
+    rand_id = rand() % num_objects;
     newName = generate_object_name(rand_id, prevPid);
-
     //index[slot] = rand_id;
     //release_completion(slot);
 
@@ -1393,11 +1383,13 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
     completion_wait(slot);
     lock.Lock();
     r = completion_ret(slot);
+#if 0
     if (r != 0 && r != -ENOENT) { // file does not exist
       cerr << "remove got " << r << std::endl;
       lock.Unlock();
       goto ERR;
     }
+#endif
     ++data.finished;
     --data.in_flight;
     lock.Unlock();
@@ -1444,7 +1436,6 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
   return 0;
 
  ERR:
-  out(cout) << "Err: Removed " << data.finished << std::endl;
   lock.Lock();
   data.done = 1;
   lock.Unlock();

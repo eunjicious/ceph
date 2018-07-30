@@ -56,6 +56,7 @@ struct bench_data {
 const int OP_WRITE     = 1;
 const int OP_SEQ_READ  = 2;
 const int OP_RAND_READ = 3;
+const int OP_RAND_REMOVE = 4;
 
 // Object is composed of <oid,namespace>
 typedef std::pair<std::string, std::string> Object;
@@ -81,6 +82,8 @@ protected:
   int rand_read_bench(int secondsToRun, int num_objects, int concurrentios, int writePid, bool no_verify=false);
 
   int clean_up(int num_objects, int prevPid, int concurrentios);
+  // EUNJI: note: max_objects = remove_ratio 
+  int clean_up_partial(int num_objects, int prevPid, int concurrentios, unsigned max_objects); 
   bool more_objects_matching_prefix(const std::string& prefix, std::list<Object>* name);
 
   virtual int completions_init(int concurrentios) = 0;

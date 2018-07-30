@@ -698,7 +698,9 @@ int KStore::_open_fsid(bool create)
   int flags = O_RDWR;
   if (create)
     flags |= O_CREAT;
-  fsid_fd = ::openat(path_fd, "fsid", flags, 0644);
+// EUNJI 
+  //fsid_fd = ::openat(path_fd, "fsid", flags, 0644);
+  fsid_fd = ::openat(path_fd, "kv_fsid", flags, 0644);
   if (fsid_fd < 0) {
     int err = -errno;
     derr << __func__ << " " << cpp_strerror(err) << dendl;
@@ -1068,7 +1070,9 @@ void KStore::_sync()
 
 int KStore::statfs(struct store_statfs_t* buf)
 {
-  return db->get_statfs(buf);
+// EUNJI
+  //return db->get_statfs(buf);
+  return 1;
 }
 
 // ---------------

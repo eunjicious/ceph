@@ -98,10 +98,12 @@ void usage(ostream& out)
 "   rollback <obj-name> <snap-name>  roll back object to snap <snap-name>\n"
 "\n"
 "   listsnaps <obj-name>             list the snapshots of this object\n"
-"   bench <seconds> write|seq|rand [-t concurrent_operations] [--no-cleanup] [--run-name run_name] [--no-hints]\n"
+//"   bench <seconds> write|seq|rand [-t concurrent_operations] [--no-cleanup] [--run-name run_name] [--no-hints]\n"
+"   bench <seconds> write|seq|rand|rand_remove [-t concurrent_operations] [--no-cleanup] [--run-name run_name] [--no-hints] [--remove-ratio]\n"
 "                                    default is 16 concurrent IOs and 4 MB ops\n"
-"                                    default is to clean up after write benchmark\n"
+"                                    default is to clean up after write benchmark\"
 "                                    default run-name is 'benchmark_last_metadata'\n"
+"									 default remove-ratio is 100 (100%)\n"
 "   cleanup [--run-name run_name] [--prefix prefix]\n"
 "                                    clean up a previous benchmark operation\n"
 "                                    default run-name is 'benchmark_last_metadata'\n"
@@ -1608,6 +1610,7 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
   unsigned op_size = default_op_size;
   unsigned object_size = 0;
   unsigned max_objects = 0;
+  unsigned remove_ratio = 100; // EUNJI 
   uint64_t obj_offset = 0;
   bool block_size_specified = false;
   int bench_write_dest = 0;
@@ -1711,6 +1714,13 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       return -EINVAL;
     }
   }
+  i = opts.find("remove-ratio");
+  if (i != opts.end()){
+    if (rados_sistrtoll(i, &remove_ratio)) {
+      return -EINVAL;
+	}
+  }
+
   i = opts.find("offset");
   if (i != opts.end()) {
     if (rados_sistrtoll(i, &obj_offset)) {
@@ -2957,8 +2967,14 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
       operation = OP_SEQ_READ;
     else if (strcmp(nargs[2], "rand") == 0)
       operation = OP_RAND_READ;
+	// EUNJI 
+	else if (strcmp(nargs[2], "rand_remove") == 0)
+	  operation = OP_RAND_REMOVE;
     else
       usage_exit();
+
+
+	// option validation 
     if (operation != OP_WRITE) {
       if (block_size_specified) {
         cerr << "-b|--block_size option can be used only with `write' bench test"
@@ -3002,6 +3018,12 @@ static int rados_tool_common(const std::map < std::string, std::string > &opts,
     else if (object_size < op_size)
       op_size = object_size;
     cout << "hints = " << (int)hints << std::endl;
+
+	// EUNJI 
+	if(operation == OP_RAND_REMOVE) {
+	  max_objects = remove_ratio; // to be removed 
+	}
+
     ret = bencher.aio_bench(operation, seconds,
 			    concurrent_ios, op_size, object_size,
 			    max_objects, cleanup, hints, run_name, no_verify);
@@ -3605,6 +3627,8 @@ int main(int argc, const char **argv)
       opts["object-size"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--max-objects", (char*)NULL)) {
       opts["max-objects"] = val;
+	} else if (ceph_argparse_witharg(args, i, &val, "--remove-ratio", (char*)NULL)) {
+	  opts["remove-ratio"] = val; // EUNJI 
     } else if (ceph_argparse_witharg(args, i, &val, "--offset", (char*)NULL)) {
       opts["offset"] = val;
     } else if (ceph_argparse_witharg(args, i, &val, "-o", (char*)NULL)) {
