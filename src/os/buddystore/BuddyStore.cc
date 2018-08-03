@@ -1961,23 +1961,23 @@ void BuddyStore::_do_transaction(Transaction& t, uint64_t op_seq,
       break;
 
     case Transaction::OP_WRITE:
-      {
-	//EUNJI 
-	dout(10) << " punch_hole_ops " << t.punch_hole_ops.size() << dendl;
-	assert(t.punch_hole_ops.size() > 0);
+	  {
+		//EUNJI 
+		dout(10) << " punch_hole_ops " << t.punch_hole_ops.size() << dendl;
+		assert(t.punch_hole_ops.size() > 0);
 
-        coll_t cid = i.get_cid(op->cid);
-        ghobject_t oid = i.get_oid(op->oid);
-        uint64_t off = op->off;
-        uint64_t len = op->len;
-	uint32_t fadvise_flags = i.get_fadvise_flags();
-  
-	bufferlist bl;
-        i.decode_bl(bl); 
-	dout(10) << __func__ << " write bl length " << bl.length() << dendl;
-	dout(10) << __func__ << " data_bl_p " << i.data_bl_p.get_remaining() << dendl;
-	r = _write(cid, oid, off, len, bl, fadvise_flags); 
-      }
+		coll_t cid = i.get_cid(op->cid);
+		ghobject_t oid = i.get_oid(op->oid);
+		uint64_t off = op->off;
+		uint64_t len = op->len;
+		uint32_t fadvise_flags = i.get_fadvise_flags();
+
+		bufferlist bl;
+		i.decode_bl(bl); 
+		dout(10) << __func__ << " write bl length " << bl.length() << dendl;
+		dout(10) << __func__ << " data_bl_p " << i.data_bl_p.get_remaining() << dendl;
+		r = _write(cid, oid, off, len, bl, fadvise_flags); 
+	  }
       break;
 
     case Transaction::OP_ZERO:
@@ -3483,11 +3483,11 @@ BuddyStore::ObjectRef BuddyStore::Collection::create_object() const {
 }
 
 // EUNJI 
-/*************************************/
-/* insert index                      */
-/* This function should called after */
-/* logging completed 	      	     */
-/*************************************/
+/****************************************/
+/* insert index                      	*/
+/* This function should be called after */
+/* logging completed 	      	     	*/
+/****************************************/
 
 int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const off_t ooff, 
   const off_t foff, const ssize_t bytes)
@@ -3761,7 +3761,6 @@ void BuddyStore::queue_op(OpSequencer *osr, Op *o)
 	  << dendl;
   op_wq.queue(osr);
 }
-
 
 void BuddyStore::queue_data_op(OpSequencer *osr, Op *o)
 {
@@ -4190,6 +4189,8 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
   //--------------------
   // Update offset with a file for each object. 
   // -------------------
+  // 인덱스 정보를 여기에서 업데이트 해줌. 
+
   for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
       iovp != o->tls_iov.end(); iovp++) {
       buddy_iov_t iov = *iovp; 
