@@ -34,21 +34,21 @@ public:
     }
 
     /// Set Keys (via encoded bufferlist)
-    void set(
-      const std::string &prefix,      ///< [in] prefix
-      bufferlist& to_set_bl     ///< [in] encoded key/values to set
-      ) {
-      bufferlist::iterator p = to_set_bl.begin();
-      uint32_t num;
-      ::decode(num, p);
-      while (num--) {
-	string key;
-	bufferlist value;
-	::decode(key, p);
-	::decode(value, p);
-	set(prefix, key, value);
-      }
-    }
+	void set(
+		const std::string &prefix,      ///< [in] prefix
+		bufferlist& to_set_bl     ///< [in] encoded key/values to set
+		) {
+	  bufferlist::iterator p = to_set_bl.begin();
+	  uint32_t num;
+	  ::decode(num, p);
+	  while (num--) {
+		string key;
+		bufferlist value;
+		::decode(key, p);
+		::decode(value, p);
+		set(prefix, key, value);
+	  }
+	}
 
     /// Set Key
     virtual void set(
@@ -198,6 +198,7 @@ public:
     virtual int seek_to_first(const std::string &prefix) = 0;
     virtual int seek_to_last() = 0;
     virtual int seek_to_last(const std::string &prefix) = 0;
+	virtual int seek_for_prev(const std::string & prefix, const std::string & to) = 0;
     virtual int upper_bound(const std::string &prefix, const std::string &after) = 0;
     virtual int lower_bound(const std::string &prefix, const std::string &to) = 0;
     virtual bool valid() = 0;

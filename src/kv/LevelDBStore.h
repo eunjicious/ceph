@@ -257,13 +257,31 @@ public:
       }
       return dbiter->status().ok() ? 0 : -1;
     }
+	// EUNJI: target? prefix? 
+	int seek_for_prev(const string &prefix, const string &to) override {
+	  // Leveldb not supports SeekForPrev
+	  // 이거 하려면 Seek() 를 한다음에 target 과 값이 같으면 return 
+	  string target = combine_strings(prefix, to);
+	  leveldb::Slice slice_target(target);
+
+	  dbiter->Seek(slice_target);
+	  if (!dbiter->Valid()){
+		dbiter->SeekToLast();
+	  } else { // valid 
+		pair<string,string> key = raw_key();
+		if (!(key.first == prefix && key.second == to))
+		  dbiter->Prev();
+	  }
+	  return dbiter->status().ok() ? 0 : -1;
+	}
+
     int upper_bound(const string &prefix, const string &after) override {
       lower_bound(prefix, after);
-      if (valid()) {
-	pair<string,string> key = raw_key();
-	if (key.first == prefix && key.second == after)
-	  next();
-      }
+	  if (valid()) {
+		pair<string,string> key = raw_key();
+		if (key.first == prefix && key.second == after)
+		  next();
+	  }
       return dbiter->status().ok() ? 0 : -1;
     }
     int lower_bound(const string &prefix, const string &to) override {

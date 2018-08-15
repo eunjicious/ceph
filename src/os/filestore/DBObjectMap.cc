@@ -1133,13 +1133,17 @@ DBObjectMap::Header DBObjectMap::_lookup_map_header(
     }
   }
 
+  // EUNJI: no hit in cache: 실제 db 에서 읽어옴. 
   bufferlist out;
   int r = db->get(HOBJECT_TO_SEQ, map_header_key(oid), &out);
+
+  // Header 없는 경우 
   if (r < 0 || out.length()==0) {
     delete header;
     return Header();
   }
 
+  // Header 가 있는 경우 
   Header ret(header, RemoveOnDelete(this));
   bufferlist::iterator iter = out.begin();
 

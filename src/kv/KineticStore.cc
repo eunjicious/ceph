@@ -286,6 +286,13 @@ int KineticStore::KineticWholeSpaceIteratorImpl::seek_to_last(const string &pref
   return 0;
 }
 
+int KineticStore::KineticWholeSpaceIteratorImpl::seek_for_prev(const string &prefix, const string &to)
+{
+  // EUNJI: not implemented 
+  return -1;
+}
+
+
 int KineticStore::KineticWholeSpaceIteratorImpl::upper_bound(const string &prefix, const string &after) {
   dout(30) << "kinetic iterator upper_bound()" << dendl;
   string bound = combine_strings(prefix, after);

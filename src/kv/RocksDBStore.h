@@ -322,6 +322,7 @@ public:
     int seek_to_first(const string &prefix) override;
     int seek_to_last() override;
     int seek_to_last(const string &prefix) override;
+	int seek_for_prev(const std::string & prefix, const std::string & to) override;
     int upper_bound(const string &prefix, const string &after) override;
     int lower_bound(const string &prefix, const string &to) override;
     bool valid() override;

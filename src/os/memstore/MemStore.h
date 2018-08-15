@@ -143,14 +143,14 @@ public:
       uint32_t s = object_map.size();
       ::encode(s, bl);
       for (map<ghobject_t, ObjectRef>::const_iterator p = object_map.begin();
-	   p != object_map.end();
-	   ++p) {
-	::encode(p->first, bl);
-	p->second->encode(bl);
-      }
-      ENCODE_FINISH(bl);
-    }
-    void decode(bufferlist::iterator& p) {
+		  p != object_map.end();
+		  ++p) {
+		::encode(p->first, bl);
+		p->second->encode(bl);
+	  }
+	  ENCODE_FINISH(bl);
+	}
+	void decode(bufferlist::iterator& p) {
       DECODE_START(1, p);
       ::decode(xattr, p);
       ::decode(use_page_set, p);

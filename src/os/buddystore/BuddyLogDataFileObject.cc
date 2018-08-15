@@ -91,8 +91,8 @@ int BuddyLogDataFileObject::create_or_open_file(int out_flags)
     //bl.append_zero(prewrite_unit_bytes);
     bl.append_zero(1UL << 24); // 16MB
 
-    off_t prewrite_size = prewrite_unit_bytes << 10;
-    off_t pos = st.st_size;
+    uint64_t prewrite_size = prewrite_unit_bytes << 10;
+    uint64_t pos = st.st_size;
 
     ldout(cct,10) << __func__ << " current data_file size " << pos << dendl;
 
@@ -221,8 +221,8 @@ void BuddyLogDataFileObject::_stat_file()
  ****/
 // move to collection ... 
 #if 0
-int BuddyLogDataFileObject::insert_index(const ghobject_t& oid, const off_t ooff, 
-    const off_t foff, const ssize_t bytes )
+int BuddyLogDataFileObject::ninsert_index(const ghobject_t& oid, const uint64_t ooff, 
+    const uint64_t foff, const uint64_t bytes )
 {
 
 
@@ -234,8 +234,8 @@ int BuddyLogDataFileObject::insert_index(const ghobject_t& oid, const off_t ooff
   buddy_index_map_t* omap;
   buddy_index_t* nidx = new buddy_index_t(ooff, foff, bytes); 
 
-  off_t ns = 0, ne = 0, os = 0, oe = 0;
-  map<off_t, buddy_index_t>::iterator sp, p;
+  uint64_t ns = 0, ne = 0, os = 0, oe = 0;
+  map<uint64_t, buddy_index_t>::iterator sp, p;
 
   // find map 
   map<ghobject_t, buddy_index_map_t>::iterator omap_p = log_index_map.find(oid);
@@ -309,7 +309,7 @@ int BuddyLogDataFileObject::insert_index(const ghobject_t& oid, const off_t ooff
   omap->index_map.insert(make_pair(ooff, (*nidx)));
 
 // for debugging... 
-  for(map<off_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
+  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
       tmp != omap->index_map.end() ; tmp++){
     ldout(cct, 10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
   }
@@ -325,8 +325,32 @@ int BuddyLogDataFileObject::insert_index(const ghobject_t& oid, const off_t ooff
  */
 
 int BuddyLogDataFileObject::alloc_space(coll_t cid, const ghobject_t& oid, 
-    const off_t ooff, const ssize_t bytes, vector<buddy_iov_t>& iov)
+    const uint64_t ooff, const uint64_t bytes, vector<buddy_iov_t>& iov)
 {
+  ldout(cct, 10) << __func__ << " cid " << cid << " oid " << oid << " ooff " << ooff << dendl;
+  bool need_punch_hole = false;
+  {
+	Mutex::Locker l(lock);
+
+	//buddy_iov_t* niov = new buddy_iov_t(cid, oid, fname, 0, ooff, tail_off, bytes); 
+	buddy_iov_t* niov = new buddy_iov_t(cid, oid, ooff, tail_off, bytes, 0, 0);
+	iov.push_back(*niov);
+
+	// alloc 
+	tail_off += niov->get_alloc_bytes();
+
+	// bg_reclaim 
+	if (need_punch_hole && bg_reclaim) {
+	  ldout(cct, 4) << " need_punch_hole true " << dendl;
+	  punch_hole_lock.Lock();
+	  force_punch_hole = true;
+	  punch_hole_cond.Signal();
+	  punch_hole_lock.Unlock();
+	}
+  }
+  return 0;
+
+#if 0
 
   bool need_punch_hole = false;
   {
@@ -334,14 +358,14 @@ int BuddyLogDataFileObject::alloc_space(coll_t cid, const ghobject_t& oid,
 
   ldout(cct, 10) << __func__ << " cid " << cid << " oid " << oid << " ooff " << ooff << dendl;
 
-  off_t eoff = ooff + bytes - 1;
-  off_t bsoff = round_down(ooff); 
-  off_t beoff = round_up(eoff);
-  off_t off_in_blk = ooff - bsoff;
+  uint64_t eoff = ooff + bytes - 1;
+  uint64_t bsoff = round_down(ooff); 
+  uint64_t beoff = round_up(eoff);
+  uint64_t off_in_blk = ooff - bsoff;
   uint64_t alloc_bytes = beoff - bsoff;
 
   // 1. allocate space at block granularity 
-  off_t foff = tail_off + off_in_blk;
+  uint64_t foff = tail_off + off_in_blk;
 
 
   tail_off += alloc_bytes;
@@ -364,8 +388,9 @@ int BuddyLogDataFileObject::alloc_space(coll_t cid, const ghobject_t& oid,
   // log 에서 하나로 할당할 때는 저렇게 하니까. 
   //
   //buddy_iov_t* niov = new buddy_iov_t(&cid, BD_ORIG_F, fname, 0, foff, bytes); 
-  buddy_iov_t* niov = new buddy_iov_t(cid, oid, fname, 0, ooff, foff, bytes, alloc_bytes); 
-  assert(niov->off_in_blk == off_in_blk);
+  buddy_iov_t* niov = new buddy_iov_t(cid, oid, fname, 0, ooff, foff, bytes); 
+ // assert(niov->off_in_blk == off_in_blk);
+  //assert(niov->src_off == off_in_blk);
 
   iov.push_back(*niov);
 
@@ -418,6 +443,7 @@ int BuddyLogDataFileObject::alloc_space(coll_t cid, const ghobject_t& oid,
   }
  
   return 0;
+#endif
 }
 
 /**********
@@ -448,19 +474,23 @@ int BuddyLogDataFileObject::release_space(const buddy_index_map_t& omap)
   // found map 
   //buddy_index_map_t omap = omap_p->second;
 
-  for(map<off_t, buddy_index_t>::const_iterator p = omap.index_map.begin();
+  for(map<uint64_t, buddy_index_t>::const_iterator p = omap.index_map.begin();
       p != omap.index_map.end(); p++) {
 
     ldout(cct, 10) << __func__ << " free index : " << p->second << dendl;
     // add to free map
-    auto r = free_index_map.insert(make_pair(p->second.foff, p->second.alloc_bytes));
+	buddy_index_t idx = p->second;
+
+    auto r = free_index_map.insert(make_pair(idx.foff, idx.get_alloc_bytes()));
     if(!r.second) {
       ldout(cct, 10) << __func__ << " free_index_map already contains buddy_index_t " << *p << dendl;
       assert(0);
     }
 
     // punch_hole : we might want to coalescing holes in the future..
-    int ret = fallocate(dfd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, p->second.foff, p->second.alloc_bytes);
+    //int ret = fallocate(dfd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, p->second.foff, p->second.alloc_bytes);
+    int ret = fallocate(dfd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, 
+	  idx.get_alloc_soff(), idx.get_alloc_bytes());
 
     if (ret < 0 ){
       ldout(cct, 10) << __func__ << " failed to punch_hole " << *p << dendl;
@@ -482,7 +512,7 @@ int BuddyLogDataFileObject::release_space(const buddy_index_map_t& omap)
  * get_space_info
  */
 
-int BuddyLogDataFileObject::get_space_info(const ghobject_t& oid, const off_t ooff, const ssize_t bytes, 
+int BuddyLogDataFileObject::get_space_info(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, 
     vector<buddy_iov_t>& iov)
 {
 
@@ -500,21 +530,21 @@ int BuddyLogDataFileObject::get_space_info(const ghobject_t& oid, const off_t oo
 
   // found map 
   buddy_index_map_t* omap = &omap_p->second;
-  map<off_t, buddy_index_t>::iterator p;
+  map<uint64_t, buddy_index_t>::iterator p;
 
 // for debugging... 
-  for(map<off_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
+  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
       tmp != omap->index_map.end() ; tmp++){
     ldout(cct, 10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
   }
 
 
-  ssize_t rbytes = bytes;
-  off_t soff = ooff;
-  off_t eoff = ooff + bytes;
-  off_t foff = 0;
-  ssize_t fbytes = 0;
-  off_t peoff = 0;
+  uint64_t rbytes = bytes;
+  uint64_t soff = ooff;
+  uint64_t eoff = ooff + bytes;
+  uint64_t foff = 0;
+  uint64_t fbytes = 0;
+  uint64_t peoff = 0;
 
   p = omap->index_map.upper_bound(soff);
   if (p == omap->index_map.begin()){
@@ -556,15 +586,15 @@ int BuddyLogDataFileObject::get_space_info(const ghobject_t& oid, const off_t oo
 /******
  * truncate_space 
  */
-int BuddyLogDataFileObject::truncate_space(const ghobject_t& oid, ssize_t size)
+int BuddyLogDataFileObject::truncate_space(const ghobject_t& oid, uint64_t size)
 {
   ldout(cct,10) << __func__  << " oid " << oid << " size " << size << dendl;
 
-  off_t hoff = hash_to_hoff(oid);
+  uint64_t hoff = hash_to_hoff(oid);
 
   RWLock::WLocker l(lock);
 
-  map<off_t, buddy_lindex_t>::iterator p = hash_index_map.find(hoff);
+  map<uint64_t, buddy_lindex_t>::iterator p = hash_index_map.find(hoff);
 
   if(p == hash_index_map.end())
     return -1; // no exist
@@ -573,8 +603,8 @@ int BuddyLogDataFileObject::truncate_space(const ghobject_t& oid, ssize_t size)
     << " abytes " << p->second.alloc_bytes << dendl;
 
   // add more space?
-  ssize_t pad_bytes;
-  off_t pad_off;
+  uint64_t pad_bytes;
+  uint64_t pad_off;
   if(size > p->second.used_bytes){
     pad_bytes = size - p->second.used_bytes;
     pad_off = p->second.used_bytes + 1;
@@ -603,9 +633,9 @@ int BuddyLogDataFileObject::clone_space(const ghobject_t& ooid,
 
   RWLock::WLocker l(lock);
   // get ooid space 
-  off_t ohoff = hash_to_hoff(ooid);
+  uint64_t ohoff = hash_to_hoff(ooid);
 
-  map<off_t, buddy_lindex_t>::iterator op = hash_index_map.find(ohoff);
+  map<uint64_t, buddy_lindex_t>::iterator op = hash_index_map.find(ohoff);
   if (op == hash_index_map.end()){
     ldout(cct,10) << "old oid is not found" << dendl;
     return -1;
@@ -614,7 +644,7 @@ int BuddyLogDataFileObject::clone_space(const ghobject_t& ooid,
 }
 
 int BuddyLogDataFileObject::clone_space(const ghobject_t& ooid, 
-    const ghobject_t& noid, off_t srcoff, size_t bytes, off_t dstoff, 
+    const ghobject_t& noid, uint64_t srcoff, size_t bytes, uint64_t dstoff, 
     vector<buddy_iov_t>& iov)
 {
   ldout(cct,10) << __func__  << " ooid " << ooid << " noid " << noid 
@@ -623,18 +653,18 @@ int BuddyLogDataFileObject::clone_space(const ghobject_t& ooid,
   RWLock::WLocker l(lock);
 
   // get ooid space 
-  off_t ohoff = hash_to_hoff(ooid);
-  off_t nhoff = hash_to_hoff(noid);
+  uint64_t ohoff = hash_to_hoff(ooid);
+  uint64_t nhoff = hash_to_hoff(noid);
   ldout(cct,10) << "ohoff " << ohoff << " nhoff " << nhoff << dendl;
 
-  map<off_t, buddy_lindex_t>::iterator op = hash_index_map.find(ohoff);
+  map<uint64_t, buddy_lindex_t>::iterator op = hash_index_map.find(ohoff);
   if (op == hash_index_map.end()){
     ldout(cct,10) << "old oid is not found" << dendl;
     return -1;
   }
 
   // alloc space for new object 
-  alloc_space(op->second.ctype, noid, 0, (ssize_t)(dstoff + bytes), iov);  
+  alloc_space(op->second.ctype, noid, 0, (uint64_t)(dstoff + bytes), iov);  
   
   ldout(cct,10) << "read_file " << fname << " " << ohoff+srcoff << "~" << bytes << dendl; 
   // read and copy 
@@ -693,9 +723,9 @@ int BuddyLogDataFileObject::write_fd(bufferlist& bl, uint64_t foff, int fd)
   // foff 도 align 맞춰줘야 함.. 젠장.. 
   // 앞의 부분 없으면 채워서 보내줘야 함... 
   // 여기서 보내기 전에 BLK_SIZE (적어도 512바이트 단위) 로 size 맞춰줘야 함.
-  off_t orig_len = bl.length();
-  off_t align_len = round_up (bl.length());
-  off_t align_foff = round_down (foff);
+  uint64_t orig_len = bl.length();
+  uint64_t align_len = round_up (bl.length());
+  uint64_t align_foff = round_down (foff);
   ldout(cct, 10) << __func__ << " align_len " << align_len << " align_off " << align_foff << dendl;
 
   bufferlist abl;
@@ -757,9 +787,9 @@ int BuddyLogDataFileObject::write_fd(bufferlist& bl, uint64_t foff)
   // foff 도 align 맞춰줘야 함.. 젠장.. 
   // 앞의 부분 없으면 채워서 보내줘야 함... 
   // 여기서 보내기 전에 BLK_SIZE (적어도 512바이트 단위) 로 size 맞춰줘야 함.
-  off_t orig_len = bl.length();
-  off_t align_len = round_up (bl.length());
-  off_t align_foff = round_down (foff);
+  uint64_t orig_len = bl.length();
+  uint64_t align_len = round_up (bl.length());
+  uint64_t align_foff = round_down (foff);
   ldout(cct, 10) << __func__ << " align_len " << align_len << " align_off " << align_foff << dendl;
 
   bufferlist abl;
@@ -886,8 +916,8 @@ int BuddyLogDataFileObject::read_fd(bufferlist& bl, uint64_t foff, size_t len, i
   ldout(cct,10) << __func__ << " read_debug: fd " << fd << " foff " << foff << " len " << len << " bl.length() " << bl.length() << dendl;
 
   // for test 
-  ssize_t blen = round_up(len);
-  ssize_t boff = round_down(foff);
+  uint64_t blen = round_up(len);
+  uint64_t boff = round_down(foff);
   bufferlist bbl;
 
   ldout(cct,10) << __func__ << " read_debug: boff " << boff << " blen " << blen << dendl;
@@ -927,8 +957,8 @@ int BuddyLogDataFileObject::read_fd(bufferlist& bl, uint64_t foff, size_t len)
   ldout(cct,10) << __func__ << " read_debug: dfd " << dfd << " foff " << foff << " len " << len << " bl.length() " << bl.length() << dendl;
 
   // for test 
-  ssize_t blen = round_up(len);
-  ssize_t boff = round_down(foff);
+  uint64_t blen = round_up(len);
+  uint64_t boff = round_down(foff);
   bufferlist bbl;
 
   ldout(cct,10) << __func__ << " read_debug: boff " << boff << " blen " << blen << dendl;
@@ -980,11 +1010,11 @@ int BuddyLogDataFileObject::preallocate(uint64_t offset, size_t len)
 
 
   // read file size 
-  off_t fsize = st.st_size;
-  off_t soff = round_up(fsize - 1);
+//  uint64_t fsize = st.st_size;
+//  uint64_t soff = round_up(fsize - 1);
 
-  soff = soff < offset ? offset : soff;
-  assert(soff % BUDDY_FALLOC_SIZE == 0);
+//  soff = soff < offset ? offset : soff;
+//  assert(soff % BUDDY_FALLOC_SIZE == 0);
 
   //size_t alloc_bytes = 0;
   size_t alloc_unit = 1 << 20; // 1MB 
@@ -1077,7 +1107,7 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
 	// 512KB 나 1M 를 2G 쓸때까지 수행 :
 
 #if 0
-  for(map<off_t, buddy_index_t>::const_iterator p = omap.index_map.begin();
+  for(map<uint64_t, buddy_index_t>::const_iterator p = omap.index_map.begin();
       p != omap.index_map.end(); p++) {
 
     ldout(cct, 10) << __func__ << " free index : " << p->second << dendl;
@@ -1100,11 +1130,11 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
 	//slot_lock.Lock();
 	lock.Lock();
 	
-	ssize_t punch_hole_size = 0;
+	uint64_t punch_hole_size = 0;
 	bool need_prewrite = false;
 	int i; 
-	//map<off_t, ssize_t> hole_map;
-	list<ssize_t> holes; // length
+	//map<uint64_t, uint64_t> hole_map;
+	list<uint64_t> holes; // length
 
 	_stat_file();
 	
@@ -1117,10 +1147,10 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
   
 	  if (util < low_util_ratio) {
 		// punch_hole: 
-		ssize_t hole = 1UL << 24; // 16MB
+		uint64_t hole = 1UL << 24; // 16MB
 
 		slot_limit_bytes[i] = slot_limit_bytes[i] - hole;
-		//ssize_t hole = slot_limit_bytes[i]*0.1;
+		//uint64_t hole = slot_limit_bytes[i]*0.1;
 		total_pool_bytes -= hole;
 		
 		holes.push_back(hole);
@@ -1150,7 +1180,7 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
 	lock.Unlock();
 
 	// do punch 
-	for(list<ssize_t>::iterator p = holes.begin();
+	for(list<uint64_t>::iterator p = holes.begin();
 	  p != holes.end();
 	  p++){
 
@@ -1164,7 +1194,7 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
 
 	  ldout(cct,10) << __func__ << " tmp_file size " << st.st_size << dendl;
 		
-	  off_t pos = st.st_size - (*p);
+	  uint64_t pos = st.st_size - (*p);
 
 	  r = fallocate(dfd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, pos, *p);
 	  if (r < 0) {
@@ -1217,8 +1247,8 @@ void BuddyLogDataFileObject::punch_hole_thread_entry()
 
 	  ldout(cct,10) << __func__ << " tmp_file size " << st.st_size << dendl;
 		
-	  off_t pos = rand() % ((total_reserved_bytes - *p) - tail_off); 
-	  //off_t pos = rand() % st.st_size; 
+	  uint64_t pos = rand() % ((total_reserved_bytes - *p) - tail_off); 
+	  //uint64_t pos = rand() % st.st_size; 
 
 	  r = fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, pos, *p);
 	  if (r < 0) {
@@ -1256,8 +1286,8 @@ void BuddyLogDataFileObject::prewrite_thread_entry()
 {
   ldout(cct, 4) << __func__ << dendl;
 
-  ssize_t to_be_written = 1UL << 30;
-  ssize_t written = 0;
+  uint64_t to_be_written = 1UL << 30;
+  uint64_t written = 0;
 
   prewrite_lock.Lock();
 
@@ -1351,8 +1381,8 @@ int BuddyLogDataFileObject::do_prewrite()
   // do prewrite ..  
   bufferlist bl;
 
-  off_t prewrite_size = 1UL << (20 + bg_reclaim); // 1MB 
-  off_t pos = st.st_size;
+  uint64_t prewrite_size = 1UL << (20 + bg_reclaim); // 1MB 
+  uint64_t pos = st.st_size;
 
   bl.append_zero(prewrite_size);
 

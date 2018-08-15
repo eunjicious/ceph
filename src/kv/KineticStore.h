@@ -127,6 +127,7 @@ public:
     int seek_to_first(const string &prefix);
     int seek_to_last();
     int seek_to_last(const string &prefix);
+	int seek_for_prev(const std::string & prefix, const std::string & to);
     int upper_bound(const string &prefix, const string &after);
     int lower_bound(const string &prefix, const string &to);
     bool valid();

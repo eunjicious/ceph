@@ -1,0 +1,47 @@
+
+void BuddyJournal::start_writer()
+{
+  write_stop = false;
+  aio_stop = false;
+  write_thread.create("journal_write");
+#ifdef HAVE_LIBAIO
+  if (aio)
+    write_finish_thread.create("journal_wrt_fin");
+#endif
+}
+
+void BuddyJournal::stop_writer()
+{
+  // Do nothing if writer already stopped or never started
+  if (!write_stop)
+  {
+    {
+      Mutex::Locker l(write_lock);
+      Mutex::Locker p(writeq_lock);
+      write_stop = true;
+      writeq_cond.Signal();
+      // Doesn't hurt to signal commit_cond in case thread is waiting there
+      // and caller didn't use committed_thru() first.
+      commit_cond.Signal();
+    }
+    write_thread.join();
+
+    // write journal header now so that we have less to replay on remount
+    write_header_sync();
+  }
+
+#ifdef HAVE_LIBAIO
+  // stop aio completeion thread *after* writer thread has stopped
+  // and has submitted all of its io
+  if (aio && !aio_stop) {
+    aio_lock.Lock();
+    aio_stop = true;
+    aio_cond.Signal();
+    write_finish_cond.Signal();
+    aio_lock.Unlock();
+    write_finish_thread.join();
+  }
+#endif
+}
+
+

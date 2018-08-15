@@ -167,6 +167,10 @@ public:
 
     int seek_to_first(const std::string &k) override;
     int seek_to_last(const std::string &k) override;
+    int seek_for_prev(const string &prefix, const string& to) override {
+	  // EUNJI: not implemented 
+	  return -1;
+	};
 
     int seek_to_first() override { return seek_to_first(std::string()); };
     int seek_to_last() override { return seek_to_last(std::string()); };

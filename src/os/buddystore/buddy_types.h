@@ -38,10 +38,10 @@ ftype_t BD_COLL_F = 0x100;
  * utils 
  ***************/
  uint32_t _reverse_bits(uint32_t v);
- off_t round_up(off_t v);
- off_t round_down(off_t v);
- off_t hash_to_hoff(const ghobject_t& oid); 
- off_t get_hash(const ghobject_t& oid);
+ uint64_t round_up(uint64_t v);
+ uint64_t round_down(uint64_t v);
+ uint64_t hash_to_hoff(const ghobject_t& oid); 
+ uint64_t get_hash(const ghobject_t& oid);
 
 //////////////////////////////////////////
 
@@ -53,42 +53,44 @@ ftype_t BD_COLL_F = 0x100;
 struct buddy_iov_t {
   coll_t cid;
   ghobject_t oid;
-
-  string fname;
-//  int fd;
-   
-  uint64_t off_in_src; // osd 넘어온 data_bl 에서의 offset 
   uint64_t ooff;
   uint64_t foff; // address of actual data placement 
-  uint64_t off_in_blk;
-
   uint64_t bytes;
-  uint64_t alloc_bytes;
+  uint64_t file_seq;
 
   bufferlist data_bl; 
+  uint64_t src_off; // osd 넘어온 data_bl 에서의 offset 
+
+  uint64_t get_alloc_soff() { return round_down(foff);}
+  uint64_t get_alloc_eoff() { 
+	uint64_t a = round_up(foff + bytes);
+	uint64_t b = round_down(foff) + data_bl.length();
+	return a > b? a : b;
+  }
+
+  uint64_t get_alloc_bytes(){
+	return get_alloc_eoff() - get_alloc_soff();
+  }
+
  
   void encode(bufferlist& bl) const 
   {
     ENCODE_START(1, 1, bl);
-    ::encode(fname, bl);
-    ::encode(off_in_src, bl);
+    ::encode(file_seq, bl);
+    ::encode(src_off, bl);
     ::encode(ooff, bl);
     ::encode(foff,bl);
-    ::encode(off_in_blk, bl);
     ::encode(bytes, bl);
-    ::encode(alloc_bytes, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator& p)
   {
     DECODE_START(1, p);
-    ::decode(fname, p);
-    ::decode(off_in_src, p);
+    ::decode(file_seq, p);
+    ::decode(src_off, p);
     ::decode(ooff, p);
     ::decode(foff, p);
-    ::decode(off_in_blk, p);
     ::decode(bytes, p);
-    ::decode(alloc_bytes, p);
     DECODE_FINISH(p);
   }
 
@@ -98,22 +100,10 @@ struct buddy_iov_t {
   friend bool operator == (const buddy_iov_t& b1, const buddy_iov_t& b2);
 
 
-  //explicit buddy_iov_t(coll_t* cid_, int ft, string fn, off_t src_off, off_t fo, uint64_t b)
-  explicit buddy_iov_t(coll_t cid_, const ghobject_t& oid_, string fn, off_t src_off, off_t _ooff, off_t _foff, uint64_t _bytes, uint64_t _alloc_bytes): cid(cid_)
-  {
-    oid = oid_;
-    fname = fn;
-
-    off_in_src = src_off;
-    ooff = _ooff;
-    foff = _foff;
-    bytes = _bytes;
-    alloc_bytes = _alloc_bytes;
-
-    off_in_blk = foff - round_down(foff);
-  }
-
-  buddy_iov_t() : fname("init"), off_in_src (0), ooff(0), foff(0), bytes(0), alloc_bytes(0){}
+  explicit buddy_iov_t(const coll_t _c, const ghobject_t& _o, uint64_t _of, uint64_t _ff, uint64_t _b, uint64_t _seq, uint64_t _sf = 0) 
+	: cid (_c), oid(_o), ooff(_of), foff(_ff), bytes(_b), file_seq(_seq), src_off(_sf) {}
+	//: cid (_cid), oid(_oid), ooff(_ooff), foff(_foff), bytes(_bytes), bnum(round_down(foff)), src_off(_src_off), file_seq(fseq)
+  buddy_iov_t() : ooff(0), foff(0), bytes(0), file_seq(0) {}
   ~buddy_iov_t(){}
 
 };
@@ -127,21 +117,28 @@ WRITE_CLASS_ENCODER(buddy_iov_t)
 struct buddy_index_t {
 
   //ghobject_t oid;
-  off_t ooff;
-  off_t foff;
-  ssize_t used_bytes;
+  uint64_t ooff;
+  uint64_t foff;
+  uint64_t bytes;
+  uint64_t file_seq;
 
-  off_t boff; 
-  ssize_t alloc_bytes;
+  uint64_t get_alloc_soff() { return round_down(foff);}
+  //uint64_t get_eoff() { return max(round_up(foff + bytes);}
+  uint64_t get_alloc_eoff() { 
+	return round_up(foff + bytes);
+  }
+
+  uint64_t get_alloc_bytes(){
+	return get_alloc_eoff() - get_alloc_soff();
+  }
+
 
   void encode(bufferlist& bl) const {
 
     ENCODE_START(1, 1, bl); // 이 숫자는 뭔지 잘 모르겠음. 
     ::encode(ooff, bl);
     ::encode(foff, bl);
-    ::encode(used_bytes, bl);
-    ::encode(boff, bl);
-    ::encode(alloc_bytes, bl);
+    ::encode(bytes, bl);
     ENCODE_FINISH(bl);
   }
 
@@ -149,9 +146,7 @@ struct buddy_index_t {
     DECODE_START(1, p);
     ::decode(ooff, p);
     ::decode(foff, p);
-    ::decode(used_bytes, p);
-    ::decode(boff, p);
-    ::decode(alloc_bytes, p);
+    ::decode(bytes, p);
     DECODE_FINISH(p);
   }
 
@@ -160,12 +155,7 @@ struct buddy_index_t {
   //friend bool operator > (const buddy_index_t& b1, const buddy_index_t& b2);
 
   explicit buddy_index_t(uint64_t oo, uint64_t fo, uint64_t ubytes): 
-    ooff(oo),
-    foff(fo),
-    used_bytes(ubytes),
-    boff(round_down(foff)),
-    alloc_bytes(round_up(foff + used_bytes -1) - foff) {
-  }
+    ooff(oo), foff(fo), bytes(ubytes) {}
   buddy_index_t(){}
   ~buddy_index_t(){}
 };
@@ -176,7 +166,7 @@ WRITE_CLASS_ENCODER(buddy_index_t)
  ************************/
 
 struct buddy_index_map_t {
-  map<off_t, buddy_index_t> index_map; // ooff 
+  map<uint64_t, buddy_index_t> index_map; // ooff 
   bufferlist *cache_bl;
 
   void encode(bufferlist& bl) const {
@@ -269,16 +259,16 @@ struct buddy_hindex_t {
 
   ghobject_t oid;
   int ctype;
-  off_t hoff;
-//  off_t ooff; // = 0. remove later 
-  off_t foff; // = hoff. remove later. log 에선 써야겠다.  
+  uint64_t hoff;
+//  uint64_t ooff; // = 0. remove later 
+  uint64_t foff; // = hoff. remove later. log 에선 써야겠다.  
   ssize_t used_bytes;
   ssize_t alloc_bytes;
 //  vector<uint64_t> sbitmap; // shadow 
 //  vector<uint64_t> cbitmap; // collision 
 
-  off_t get_alloc_end() {return hoff + alloc_bytes;}
-  off_t get_used_end() {return hoff + used_bytes;}
+  uint64_t get_alloc_end() {return hoff + alloc_bytes;}
+  uint64_t get_used_end() {return hoff + used_bytes;}
 
 // void encode(bufferlist& bl) const;
 // void decode(bufferlist::iterator& bl);
@@ -332,7 +322,7 @@ WRITE_CLASS_ENCODER(buddy_hindex_t)
 
 struct buddy_lkey_t {
   ghobject_t oid;
-  off_t ooff;
+  uint64_t ooff;
 
   void encode(bufferlist& bl) const {
 

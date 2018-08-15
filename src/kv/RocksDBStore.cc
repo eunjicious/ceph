@@ -858,6 +858,25 @@ int RocksDBStore::RocksDBWholeSpaceIteratorImpl::seek_to_last(const string &pref
   }
   return dbiter->status().ok() ? 0 : -1;
 }
+int RocksDBStore::RocksDBWholeSpaceIteratorImpl::seek_for_prev(const string &prefix, const string& to)
+{
+  string target = combine_strings(prefix, to);
+  rocksdb::Slice slice_target(target);
+
+  dbiter->SeekForPrev(slice_target);
+  //
+  //   dbiter->Seek(slice_target);
+  //  if (!dbiter->Valid()){
+  //	dbiter->SeekToLast();
+  //  } else { // valid 
+  //	pair<string,string> key = raw_key();
+  //	if (!(key.first == prefix && key.second == to))
+  //	  dbiter->Prev();
+  //  }
+
+  return dbiter->status().ok() ? 0 : -1;
+}
+
 int RocksDBStore::RocksDBWholeSpaceIteratorImpl::upper_bound(const string &prefix, const string &after)
 {
   lower_bound(prefix, after);

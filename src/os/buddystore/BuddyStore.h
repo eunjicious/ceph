@@ -1,4 +1,5 @@
 #define EUNJI
+#define FILE_CONTAINER
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
@@ -37,6 +38,8 @@
 #include "../filestore/SequencerPosition.h"
 #include "kv/KeyValueDB.h"
 #include "BuddyLogDataFileObject.h"
+//#include "FileContainerObjectStore.h"
+#include "FileContainer.h"
 #include "buddy_types.h"
 #include "BDJournalingObjectStore.h"
 #include "BuddyLogger.h"
@@ -89,6 +92,7 @@ enum {
 #endif
 //class BuddyStore : public ObjectStore, public Test {
 class BuddyStore : public BDJournalingObjectStore {
+
 public:
   struct Object : public RefCountedObject {
     CephContext *cct;
@@ -174,8 +178,8 @@ public:
     // 사실 이게.. buddy_index_map_t 를 Object 에 넣으면 되는건데
     map<ghobject_t, buddy_index_map_t> data_file_index_map; // data_file_index_map  
 
-    int data_file_insert_index(const ghobject_t& oid, const off_t ooff, const off_t foff, const ssize_t bytes); 
-    int data_file_get_index(const ghobject_t& oid, const off_t ooff, const ssize_t bytes, vector<buddy_iov_t>& iov);
+    int data_file_insert_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t foff, const uint64_t bytes); 
+    int data_file_get_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, vector<buddy_iov_t>& iov);
 
     bool use_page_set;
     bool data_hold_in_memory;
@@ -289,6 +293,18 @@ public:
 
 private:
   class OmapIteratorImpl;
+
+  FileContainer* fc; 
+  int mkfc();
+  void new_file_container();
+
+  void file_container_start();
+  void file_container_stop();
+  int file_container_map_update(vector<buddy_iov_t>& tls_iov);
+
+  Mutex fc_lock;
+  //void file_container_submit(){};
+
 
 #ifdef EUNJI
   string internal_name;
@@ -466,8 +482,10 @@ private:
     f->close_section();
   }
 
+  // file_container 
+  void _finish_fcwrite(OpSequencer *osr, Op *o);
+  friend struct C_FCWriteCompletion;
 
-  //int do_checkpoint();
 
 
   ////////////////////////////////////////////////////
@@ -711,6 +729,7 @@ private:
 
   Finisher ondisk_finisher; /// ==> 이게 문제였구먼..
   Finisher apply_finisher;
+//  Finisher fcwrite_finisher;
 
   Mutex ondisk_finisher_lock; // 이것도 문제였구먼. lock 안잡고 서로 다른 thread 가 달려들어 queue 하면 문제생김. 
 

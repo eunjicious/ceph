@@ -78,6 +78,11 @@ public:
     return 0;
   }
 
+  int seek_for_prev (const string &prefix, const string &to) override {
+	// EUNJI: not implemented
+    return 0;
+  }
+
   int lower_bound(const string &prefix, const string &to) override {
     it = db->db.lower_bound(make_pair(prefix,to));
     if ((db->db.empty()) || (it == db->db.end())) {

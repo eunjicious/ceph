@@ -421,18 +421,18 @@ public:
       __le32 dest_cid;
       __le32 dest_oid;                  //OP_CLONE, OP_CLONERANGE
       __le64 dest_off;                  //OP_CLONERANGE
-      union {
-	struct {
-	  __le32 hint_type;             //OP_COLL_HINT
-	};
-	struct {
-	  __le32 alloc_hint_flags;      //OP_SETALLOCHINT
-	};
-      };
-      __le64 expected_object_size;      //OP_SETALLOCHINT
-      __le64 expected_write_size;       //OP_SETALLOCHINT
-      __le32 split_bits;                //OP_SPLIT_COLLECTION2,OP_COLL_SET_BITS,
-                                        //OP_MKCOLL
+	  union {
+		struct {
+		  __le32 hint_type;             //OP_COLL_HINT
+		};
+		struct {
+		  __le32 alloc_hint_flags;      //OP_SETALLOCHINT
+		};
+	  };
+	  __le64 expected_object_size;      //OP_SETALLOCHINT
+	  __le64 expected_write_size;       //OP_SETALLOCHINT
+	  __le32 split_bits;                //OP_SPLIT_COLLECTION2,OP_COLL_SET_BITS,
+	  //OP_MKCOLL
       __le32 split_rem;                 //OP_SPLIT_COLLECTION2
 //EUNJI
       __le32 punch_hole_off;		//OP_WRITE
@@ -1131,29 +1131,29 @@ public:
     void write(const coll_t& cid, const ghobject_t& oid, uint64_t off, uint64_t len,
 	       const bufferlist& write_data, uint32_t flags = 0) {
       uint32_t orig_len = data_bl.length();
-      Op* _op = _get_next_op();
-      _op->op = OP_WRITE;
-      _op->cid = _get_coll_id(cid);
-      _op->oid = _get_object_id(oid);
-      _op->off = off;
-      _op->len = len;
-    //EUNJI: offset data in data_bl
-      // offset 이니까 1 안더하고 그냥 length 쓰면 되는듯. 
-      _op->punch_hole_off = orig_len;
-      punch_hole_ops.push_back((*_op));
-      assert(punch_hole_ops.size() > 0);
+	  Op* _op = _get_next_op();
+	  _op->op = OP_WRITE;
+	  _op->cid = _get_coll_id(cid);
+	  _op->oid = _get_object_id(oid);
+	  _op->off = off;
+	  _op->len = len;
+	  //EUNJI: offset data in data_bl
+	  // offset 이니까 1 안더하고 그냥 length 쓰면 되는듯. 
+	  _op->punch_hole_off = orig_len;
+	  punch_hole_ops.push_back((*_op));
+	  assert(punch_hole_ops.size() > 0);
 
-      ::encode(write_data, data_bl);
+	  ::encode(write_data, data_bl);
 
-      assert(len == write_data.length());
-      data.fadvise_flags = data.fadvise_flags | flags;
-      if (write_data.length() > data.largest_data_len) {
-	data.largest_data_len = write_data.length();
-	data.largest_data_off = off;
-	data.largest_data_off_in_data_bl = orig_len + sizeof(__u32);  // we are about to
-      }
-      data.ops++;
-    }
+	  assert(len == write_data.length());
+	  data.fadvise_flags = data.fadvise_flags | flags;
+	  if (write_data.length() > data.largest_data_len) {
+		data.largest_data_len = write_data.length();
+		data.largest_data_off = off;
+		data.largest_data_off_in_data_bl = orig_len + sizeof(__u32);  // we are about to
+	  }
+	  data.ops++;
+	}
     /**
      * zero out the indicated byte range within an object. Some
      * ObjectStore instances may optimize this to release the
@@ -1527,66 +1527,66 @@ public:
 //#ifdef EUNJI
     void encode_punch_hole(bufferlist& bl) const {
       //layout: data_bl + op_bl + coll_index + object_index + data
-      ENCODE_START(9, 9, bl);
-      //::encode(data_bl, bl);
-      //::encode(meta_data_bl, bl);
-      // 기존에도 한번은 encode 를 함. encode 할때 새로운 tbl로 copy 가 일어남. 
-      // meta 정보만 들고 있다가 새로운 tbl 에 바로 encode 하자.
-      // 그러면 추가적인 memory copy 안들어감. 
+	  ENCODE_START(9, 9, bl);
+	  //::encode(data_bl, bl);
+	  //::encode(meta_data_bl, bl);
+	  // 기존에도 한번은 encode 를 함. encode 할때 새로운 tbl로 copy 가 일어남. 
+	  // meta 정보만 들고 있다가 새로운 tbl 에 바로 encode 하자.
+	  // 그러면 추가적인 memory copy 안들어감. 
 
-      ::encode(punch_hole_ops, bl);
-      ::encode(punch_hole_map, bl);
+	  ::encode(punch_hole_ops, bl);
+	  ::encode(punch_hole_map, bl);
 
-      uint32_t coff = 0;
-      for(vector<Op>::const_iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); iter++)
-      {	
-	bufferlist log_data;
-	log_data.substr_of(data_bl, coff, (*iter).punch_hole_off - coff);
+	  uint32_t coff = 0;
+	  for(vector<Op>::const_iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); iter++)
+	  {	
+		bufferlist log_data;
+		log_data.substr_of(data_bl, coff, (*iter).punch_hole_off - coff);
 
-	::encode_destructively(log_data, bl);
-	coff += ((*iter).len + sizeof(__u32));	
-      }
-      bufferlist log_data;
-      log_data.substr_of(data_bl, coff, data_bl.length() - coff);
-      ::encode_destructively(log_data, bl);
+		::encode_destructively(log_data, bl);
+		coff += ((*iter).len + sizeof(__u32));	
+	  }
+	  bufferlist log_data;
+	  log_data.substr_of(data_bl, coff, data_bl.length() - coff);
+	  ::encode_destructively(log_data, bl);
 
-      ::encode(op_bl, bl);
-      ::encode(coll_index, bl);
-      ::encode(object_index, bl);
-      data.encode(bl);
-      ENCODE_FINISH(bl);
-    }
+	  ::encode(op_bl, bl);
+	  ::encode(coll_index, bl);
+	  ::encode(object_index, bl);
+	  data.encode(bl);
+	  ENCODE_FINISH(bl);
+	}
 
-    void decode_punch_hole(bufferlist::iterator &bl) {
-      DECODE_START(9, bl);
-      DECODE_OLDEST(9);
-      
-      //::decode(data_bl, bl);
-      ::decode(punch_hole_ops, bl);
-      ::decode(punch_hole_map, bl);
+	void decode_punch_hole(bufferlist::iterator &bl) {
+	  DECODE_START(9, bl);
+	  DECODE_OLDEST(9);
 
-      for(vector<Op>::iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); ++iter)
-      {	
-	::decode(data_bl, bl);
-    
-	// fill out punch 
-	// hole 은 zero 를 만들어서 붙이든가 해야함.. 
-	// 여기서 원래는 punch_hole_map 보고 해당하는 file 읽어와서 replay 해야함. 
-	// 일단은 zero 로 두자. 
-	data_bl.append_zero((*iter).len);
-      }
-      ::decode(data_bl, bl);
+	  //::decode(data_bl, bl);
+	  ::decode(punch_hole_ops, bl);
+	  ::decode(punch_hole_map, bl);
 
-      ::decode(op_bl, bl);
-      ::decode(coll_index, bl);
-      ::decode(object_index, bl);
-      data.decode(bl);
-      coll_id = coll_index.size();
-      object_id = object_index.size();
+	  for(vector<Op>::iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); ++iter)
+	  {	
+		::decode(data_bl, bl);
 
-      DECODE_FINISH(bl);
-    }
-//#endif
+		// fill out punch 
+		// hole 은 zero 를 만들어서 붙이든가 해야함.. 
+		// 여기서 원래는 punch_hole_map 보고 해당하는 file 읽어와서 replay 해야함. 
+		// 일단은 zero 로 두자. 
+		data_bl.append_zero((*iter).len);
+	  }
+	  ::decode(data_bl, bl);
+
+	  ::decode(op_bl, bl);
+	  ::decode(coll_index, bl);
+	  ::decode(object_index, bl);
+	  data.decode(bl);
+	  coll_id = coll_index.size();
+	  object_id = object_index.size();
+
+	  DECODE_FINISH(bl);
+	}
+	//#endif
 
     void dump(ceph::Formatter *f);
     static void generate_test_instances(list<Transaction*>& o);

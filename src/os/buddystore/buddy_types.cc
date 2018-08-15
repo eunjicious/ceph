@@ -5,8 +5,8 @@
 #if 0
 bool operator< (const buddy_lkey_t& b1, buddy_lkey_t& b2)
 {
-  off_t h1 = get_hash(b1.oid);
-  off_t h2 = get_hash(b2.oid);
+  uint64_t h1 = get_hash(b1.oid);
+  uint64_t h2 = get_hash(b2.oid);
   
   if (h1 == h2)
     return b1.ooff < b2.ooff;
@@ -16,8 +16,8 @@ bool operator< (const buddy_lkey_t& b1, buddy_lkey_t& b2)
 
 bool operator> (const buddy_lkey_t& b1, buddy_lkey_t& b2)
 {
-  off_t h1 = get_hash(b1.oid);
-  off_t h2 = get_hash(b2.oid);
+  uint64_t h1 = get_hash(b1.oid);
+  uint64_t h2 = get_hash(b2.oid);
  
   if (h1 == h2)
     return b1.ooff > b2.ooff;
@@ -28,8 +28,8 @@ bool operator> (const buddy_lkey_t& b1, buddy_lkey_t& b2)
 
 bool operator == (const buddy_lkey_t& b1, buddy_lkey_t& b2)
 {
-  off_t h1 = get_hash(b1.oid);
-  off_t h2 = get_hash(b2.oid);
+  uint64_t h1 = get_hash(b1.oid);
+  uint64_t h2 = get_hash(b2.oid);
 
   return (h1 == h2) && (b1.ooff == b2.ooff);
 }
@@ -76,7 +76,7 @@ ostream& operator<< (ostream& out, const buddy_hindex_t& bi)
    return v;
  }
 
- off_t round_up(off_t v){
+ uint64_t round_up(uint64_t v){
   
   if( v % 4096 == 0)
       return v; 
@@ -84,16 +84,16 @@ ostream& operator<< (ostream& out, const buddy_hindex_t& bi)
  }
 
 
- off_t round_down(off_t v){
+ uint64_t round_down(uint64_t v){
    return (v >> BUDDY_FALLOC_SIZE_BITS) << BUDDY_FALLOC_SIZE_BITS;
  }
 
- off_t hash_to_hoff(const ghobject_t& oid){
+ uint64_t hash_to_hoff(const ghobject_t& oid){
    uint64_t bnum = (uint64_t)_reverse_bits(oid.hobj.get_hash());
    return bnum << BUDDY_FALLOC_SIZE_BITS; // hash(blk num) to bytes 
  }
  
- off_t get_hash(const ghobject_t& oid){
+ uint64_t get_hash(const ghobject_t& oid){
    return (uint64_t)_reverse_bits(oid.hobj.get_hash());
  }
 
@@ -102,11 +102,12 @@ ostream& operator<< (ostream& out, const buddy_hindex_t& bi)
 
 ostream& operator<< (ostream& out, const buddy_iov_t& iov)
 {
-  out << iov.fname << ':';
-  out << iov.off_in_src << ':';
-  out << iov.bytes << ':';
+  out << iov.ooff << ':';
   out << iov.foff << ':';
-  out << iov.data_bl.length();
+  out << iov.bytes << ':';
+  out << iov.file_seq << ':';
+  out << iov.data_bl.length() << ':';
+  out << iov.src_off << ':';
 
   return out;
 }
@@ -130,9 +131,9 @@ ostream& operator<< (ostream& out, const buddy_index_t& idx)
 {
   out << idx.ooff << ':';
   out << idx.foff << ':';
-  out << idx.used_bytes << ':';
-  out << idx.boff << ':';
-  out << idx.alloc_bytes << ':';
+  out << idx.bytes << ':';
+//  out << idx.boff << ':';
+//  out << idx.alloc_bytes << ':';
 
   return out;
 }

@@ -674,7 +674,6 @@ void FileJournal::stop_writer()
 }
 
 
-
 void FileJournal::print_header(const header_t &header) const
 {
   dout(10) << "header: block_size " << header.block_size
@@ -934,7 +933,9 @@ void FileJournal::queue_completions_thru(uint64_t seq)
     items.erase(it++);
   }
   batch_unpop_completions(items);
-  finisher_cond.Signal();
+  // finisher 가 들고 있는 cond 는 finisher 내부의 queue 가 비워지는 거고 
+  // 여기서는 completions 큐가 비워진 것을 알리는 것임. 
+  finisher_cond.Signal(); 
 }
 
 

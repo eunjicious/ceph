@@ -35,6 +35,7 @@
 #define dout_prefix *_dout << "buddystore "
 //#define dout_prefix *_dout << "buddystore(" << basedir << ") "
 
+//#include "BuddyStoreFileContainer.cc"
 
 const static int CEPH_DIRECTIO_ALIGNMENT(4096);
 /*******************
@@ -44,11 +45,13 @@ const static int CEPH_DIRECTIO_ALIGNMENT(4096);
 BuddyStore::BuddyStore(CephContext *cct, const string& basedir_, 
     osflagbits_t flags, const char *name ) : 
   BDJournalingObjectStore(cct, basedir_),
+  //FileContainerObjectStore(cct, basedir_),
   internal_name(name),
   basedir(basedir_),
  // journalpath(basedir_ + "/buddy.jnl"),
   journalpath("/dev/xvdb1"),
   generic_flags(flags),
+  fc_lock("BuddyStore::fc_lock"),
   logger(NULL),
   data_directio(cct->_conf->buddystore_data_directio), // default is true
   data_flush(cct->_conf->buddystore_data_flush),
@@ -259,6 +262,11 @@ int BuddyStore::mount()
   op_tp.start();
   data_op_tp.start();
 
+#ifdef FILE_CONTAINER
+  // file container 
+  new_file_container();
+  file_container_start();
+#endif
 
   // index_write_thread 
   index_write_thread.create("buddy_idx_wrt");
@@ -351,8 +359,10 @@ void BuddyStore::do_force_sync()
 ****************/
 int BuddyStore::umount()
 {
-
   dout(5) << __func__ << dendl;
+
+  // journal flush 
+  journal->flush();
 
   // data_write_thread
   dataq_lock.Lock();
@@ -366,7 +376,6 @@ int BuddyStore::umount()
 
   // sync data file 
   data_file.sync();
-
 
   // index_write_thread  
   do_force_sync();
@@ -394,6 +403,11 @@ int BuddyStore::umount()
   journal_stop();
   //if (!(generic_flags & SKIP_JOURNAL_REPLAY))
     journal_write_close();
+
+#ifdef FILE_CONTAINER
+  // file container 
+  file_container_stop();
+#endif
 
   op_tp.stop();
   data_op_tp.stop();
@@ -689,6 +703,10 @@ int BuddyStore::mkfs()
   r = mkjournal(); 
   dout(10) << "return of mkjournal() " << r << dendl;
 
+#ifdef FILE_CONTAINER
+  // file container 
+  mkfc();
+#endif
 
   r = write_meta("type", "buddystore");
   if (r < 0)
@@ -843,11 +861,11 @@ int BuddyStore::index_write_sync()
 
   int fd = r;
 
-  off_t foff = 0; // 나중에 log 방식으로 바꾸자. 
+  uint64_t foff = 0; // 나중에 log 방식으로 바꾸자. 
 
-  off_t orig_len = bl.length();
-  off_t align_len = round_up (bl.length());
-  off_t align_foff = round_down (foff);
+  uint64_t orig_len = bl.length();
+  uint64_t align_len = round_up (bl.length());
+  uint64_t align_foff = round_down (foff);
 
   dout(10) << __func__ << " align_len " << align_len << " align_off " << align_foff << dendl;
 
@@ -1597,6 +1615,20 @@ struct C_JournalCompletion : public Context {
   }
 };
 
+struct C_FCWriteCompletion : public Context {
+  BuddyStore *fs;
+  BuddyStore::OpSequencer *osr;
+  BuddyStore::Op *o;
+  //Context *onfcwrite;
+
+  //C_FCWriteCompletion(BuddyStore *f, BuddyStore::OpSequencer *os, BuddyStore::Op *o, Context *onfcwrite):
+  C_FCWriteCompletion(BuddyStore *f, BuddyStore::OpSequencer *os, BuddyStore::Op *o):
+    fs(f), osr(os), o(o) { }
+  void finish(int r) override {
+    fs->_finish_fcwrite(osr, o);
+  }
+};
+
 
 int BuddyStore::queue_transactions(Sequencer *posr,
 				 vector<Transaction>& tls,
@@ -1640,7 +1672,18 @@ int BuddyStore::queue_transactions(Sequencer *posr,
 
   // genearte iovector 
   int r;
- 
+
+
+#ifdef FILE_CONTAINER
+  if (data_flush) {
+	r = fc->prepare_write(o->tls, o->tls_iov);
+	if (r < 0){
+	  dout(5) << __func__ << " Failed to alloc space " << dendl;
+	  assert(0);
+	}
+  }
+
+#else
   if (data_flush) {
     r = generate_iov(o->tls, o->tls_iov);
     if (r < 0) {
@@ -1650,6 +1693,7 @@ int BuddyStore::queue_transactions(Sequencer *posr,
     lat -= start;
     dout(10) << __func__ << " generate_iov lat = " << lat << dendl; 
   }
+#endif
 
 
   /*************************
@@ -1683,10 +1727,19 @@ int BuddyStore::queue_transactions(Sequencer *posr,
     _op_journal_transactions(tbl, orig_len, o->op, new C_JournalCompletion(this, osr, o, ondisk), osd_op);
 
     // start data io 
-    //if (data_flush){
+#ifdef FILE_CONTAINER
+	// 원래 보내는 곳에 안보내면 read 할 때 일단 문제가 생길 수 있고. 
+	// metadata 도 문제 생길 수 있지. 
+	if (data_flush && o->tls_iov.size() > 0){
+	  uint64_t ret = fc->submit_manager.submit_start();
+	  fc->submit_entry(ret, o->tls_iov, new C_FCWriteCompletion(this, osr, o), osd_op);
+	  fc->submit_manager.submit_finish(ret);
+	}
+#else
     if (data_flush && o->tls_iov.size() > 0){
       queue_data_op(osr, o);
     }
+#endif
 
     submit_manager.op_submit_finish(op_num);
 
@@ -1814,6 +1867,7 @@ void BuddyStore::_finish_journal (OpSequencer *osr, Op *o, Context *ondisk)
  *******************/
 int BuddyStore::generate_iov(vector<Transaction>& tls, vector<buddy_iov_t>& tls_iov)
 {
+
   dout(10) << __func__  << " transactions = " << tls.size() << dendl;
 
   for (vector<Transaction>::iterator p = tls.begin(); p != tls.end(); ++p) {
@@ -1822,65 +1876,83 @@ int BuddyStore::generate_iov(vector<Transaction>& tls, vector<buddy_iov_t>& tls_
     Transaction::iterator i = tr.begin();
 
     for(vector<Transaction::Op>::iterator op_p = tr.punch_hole_ops.begin();
-	op_p != tr.punch_hole_ops.end(); ++op_p) {
+	  op_p != tr.punch_hole_ops.end(); ++op_p) {
 
-      uint32_t punch_hole_off = op_p->punch_hole_off;
-      uint32_t header_len = sizeof(__u32);
-
-      dout(10) << "punch_hole exist " << " punch_hole_off " << punch_hole_off << " header_len " << header_len
-	<< " op_len " << op_p->len << "op_off" << op_p->off << " data_bl length " << p->data_bl.length() << dendl;
-      
-      // 실제 _do_transaction 할때 문제가 생길텐데
-      // 근데 보니까 const 네. 그럼 안건드린다는 얘긴데. 
-      //bufferlist write_data_bl;
-      //write_data_bl.substr_of(p->data_bl, punch_hole_off + header_len, op_p->len);
-
-      // alloc space of hash_index_file. 
-      // split data into io vector.
       vector<buddy_iov_t> op_iov; 
 
-      // op_p->off 는 해당 오브젝트에서 어느 위치인지를 나타내는듯. 
-      uint64_t off = op_p->off;
-      uint64_t len = op_p->len;
-
+      uint64_t ooff = op_p->off;
+      uint64_t bytes = op_p->len;
       coll_t cid = i.get_cid(op_p->cid);
       ghobject_t oid = i.get_oid(op_p->oid);
 
-      // allocate space 
-      int ret = data_file.alloc_space(cid, oid, off, len, op_iov);
+	  // op_iov is set 
+	  // iov 는 vector 형태로 유지. object 가 여러개의 iov 로 쪼개질 수 있으니까. 
+      //int ret = _alloc_space(cid, oid, ooff, bytes, op_iov);
+      int ret = data_file.alloc_space(cid, oid, ooff, bytes, op_iov);
+
       if (ret < 0){
-		dout(10) << "Failed to alloc_space oid = " << oid << " off = " << off << " len = " << len << dendl;
-		//data_file.dump_hash_index_map();
+		dout(10) << "Failed to alloc_space" << dendl;
 		return -ENOENT;
       }
-	  
-	  // slot check and wake up thread 
+
+	  // prepare buffer 
+      uint32_t punch_hole_off = op_p->punch_hole_off;
+      uint32_t header_len = sizeof(__u32);
+	  uint32_t data_start_off = punch_hole_off + header_len;
+
+	  for(vector<buddy_iov_t>::iterator ip = op_iov.begin();
+		  ip != op_iov.end(); ++ip){
+
+		bufferlist newdata;
+
+		newdata.append_zero((*ip).foff - (*ip).get_alloc_soff());
+		
+		// copy data from transactions' bl 
+		newdata.substr_of(
+		  tr.data_bl, 
+		  data_start_off + (*ip).src_off, 
+		  (*ip).bytes);
+		
+		newdata.append_zero((*ip).get_alloc_bytes() - newdata.length());
+
+		(*ip).data_bl.claim(newdata);
+
+		assert((*ip).get_alloc_bytes() == (*ip).data_bl.length());
+		dout(10) << op_iov << dendl;
+
+#if 0
+		// test
+		bufferlist::iterator dp = (*ip).data_bl.begin();
+		const char *dptr;
+		dp.get_ptr_and_advance(10, &dptr);
+		for(i=0; i<10; i++) 
+		  dout(10) << __func__ << " after " << *(dptr+i) << dendl;
+#endif
+	  }
+	  // tls_iov 는 실제 write_thread 가 file 에 io 할 때 쓰는 정보임. 
+	  tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
 
 
-      // 여기에서 op_iov 에 vector 정보가 있을 것임. 
-      generate_iov_data_bl(op_iov, p->data_bl, punch_hole_off + header_len);
+	  // transaction 에서 저장하는 건 좀 더 simple 한 형태로 저장. 
+	  // 이 정보가 journal 에 적히게 됨. 
+	  // 이 정보를 저장해줘야 함. 
+	  vector<Transaction::iov_t> tmp_iov;
+	  for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
+		  iovp != op_iov.end(); ++iovp) {
 
-      // add to iov. 
-      // 원래 여기서 transaction 의 iov_t 도 만들어서 넣어줘야 함. . 
-      tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
+		tmp_iov.push_back(Transaction::iov_t(data_file.fname, (*iovp).foff, (*iovp).bytes));
+		//tmp_iov.push_back(Transaction::iov_t((*iovp).fname, (*iovp).foff, (*iovp).bytes));
+	  }
+	  tr.punch_hole_map.insert(make_pair(punch_hole_off, tmp_iov)); 
 
-      // generate iov_t with buddy_iov_t 
-      vector<Transaction::iov_t> tmp_iov;
-
-      for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
-	 iovp != op_iov.end(); ++iovp) {
-	tmp_iov.push_back(Transaction::iov_t((*iovp).fname, (*iovp).foff, (*iovp).bytes));
-      }
-      tr.punch_hole_map.insert(make_pair(punch_hole_off, tmp_iov)); 
-
-      dout(10) << "tls_iov count = " << tls_iov.size() << dendl;
-    }
+	} // end of punch_hole_ops loop  
   } // end of tls loop
 
   dout(10) << __func__  << " iov = " << tls_iov.size() << dendl;
   return 0;
 }
 #endif
+#if 0
 void BuddyStore::generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, uint32_t start_off)
 {
   dout(10) << __func__ << " iov count = " << iov.size() << dendl; 
@@ -1899,7 +1971,7 @@ void BuddyStore::generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, 
   for(vector<buddy_iov_t>::iterator ip = iov.begin();
       ip != iov.end(); ++ip){
 
-    dout(10) << __func__ << " start_off " << start_off << " ooff " << (*ip).off_in_src << " len " << (*ip).bytes << " bl.length() " << bl.length() << " alloc_bytes " << (*ip).alloc_bytes << dendl;
+    dout(10) << __func__ << " start_off " << start_off << " ooff " << (*ip).off_in_src << " len " << (*ip).bytes << " bl.length() " << bl.length() << dendl;
    
     bufferlist newdata;
   
@@ -1907,7 +1979,8 @@ void BuddyStore::generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, 
     newdata.append_zero((*ip).off_in_blk);
     newdata.substr_of(bl, start_off + (*ip).off_in_src, (*ip).bytes);
     dout(10) << " newdata length " << newdata.length() << dendl;
-    newdata.append_zero((*ip).alloc_bytes - newdata.length());
+    //newdata.append_zero((*ip).alloc_bytes - newdata.length());
+    newdata.append_zero((*ip).get_alloc_bytes - newdata.length());
     //(*ip).ooff = 0; // after bl split. 이건 원래 값 유지시킬 것.  
     dout(10) << " newdata length post_pad " << newdata.length() << dendl;
 
@@ -1928,6 +2001,7 @@ void BuddyStore::generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, 
 
   }
 }
+#endif
 
 
 void BuddyStore::_do_transaction(Transaction& t, uint64_t op_seq, 
@@ -2352,7 +2426,7 @@ int BuddyStore::_write(const coll_t& cid, const ghobject_t& oid,
 
 
   if (len > 0) {
-    const ssize_t old_size = o->get_size();
+    const uint64_t old_size = o->get_size();
 
     // EUNJI 
     o->write(offset, bl);
@@ -2383,7 +2457,7 @@ int BuddyStore::_truncate(const coll_t& cid, const ghobject_t& oid, uint64_t siz
   ObjectRef o = c->get_object(oid);
   if (!o)
     return -ENOENT;
-  const ssize_t old_size = o->get_size();
+  const uint64_t old_size = o->get_size();
   int r = o->truncate(size);
   used_bytes += (o->get_size() - old_size);
   return r;
@@ -2612,7 +2686,7 @@ int BuddyStore::_clone_range(const coll_t& cid, const ghobject_t& oldoid,
   if (srcoff + len >= oo->get_size())
     len = oo->get_size() - srcoff;
 
-  const ssize_t old_size = no->get_size();
+  const uint64_t old_size = no->get_size();
   no->clone(oo.get(), srcoff, len, dstoff);
   used_bytes += (no->get_size() - old_size);
 
@@ -3062,11 +3136,8 @@ int BufferlistObject::write(uint64_t offset, const bufferlist &src)
     return 0;
   }
 
-
   // data_hold_in_memory 
-
   dout(10) << __func__ << " data_hold_in_memory is true " << dendl;
-
  
   // before
   bufferlist newdata;
@@ -3489,8 +3560,8 @@ BuddyStore::ObjectRef BuddyStore::Collection::create_object() const {
 /* logging completed 	      	     	*/
 /****************************************/
 
-int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const off_t ooff, 
-  const off_t foff, const ssize_t bytes)
+int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const uint64_t ooff, 
+  const uint64_t foff, const uint64_t bytes)
 {
 
   dout(10) << __func__ << " oid " << oid << " ooff " << ooff <<
@@ -3501,10 +3572,10 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
   buddy_index_map_t* omap;
   buddy_index_t* nidx = new buddy_index_t(ooff, foff, bytes); 
 
-  off_t ns = 0, ne = 0, os = 0, oe = 0;
-  map<off_t, buddy_index_t>::iterator sp, p;
+  uint64_t ns = 0, ne = 0, os = 0, oe = 0;
+  map<uint64_t, buddy_index_t>::iterator sp, p;
 
-  list<off_t> delete_list;
+  list<uint64_t> delete_list;
   list<buddy_index_t> frag_list;  
 
   // find map 
@@ -3525,7 +3596,7 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
 
   // debug
   int count = 1;
-  for (map<off_t, buddy_index_t>::iterator idx_p = omap->index_map.begin();
+  for (map<uint64_t, buddy_index_t>::iterator idx_p = omap->index_map.begin();
     idx_p != omap->index_map.end();
     idx_p++){
     dout(10) << __func__ << " oid " << oid << " " << count << ":" << " index: " << idx_p->second << dendl; 
@@ -3559,7 +3630,8 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
     dout(10) << __func__ << " p iov " << p->second << dendl;
 
     os = p->second.ooff;
-    oe = p->second.ooff + p->second.used_bytes - 1;
+    oe = p->second.ooff + p->second.bytes - 1;
+    //oe = p->second.ooff + p->second.used_bytes - 1;
     dout(10) << __func__ << " os " << os << " oe " << oe << dendl;
     dout(10) << __func__ << " ns " << ns << " ne " << ne << dendl;
 
@@ -3589,7 +3661,7 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
 
     if(ns > os && ns < oe){
       dout(10) << __func__ << " partial right match " << dendl;
-      prev_idx.used_bytes -= (oe -ns + 1);
+      prev_idx.bytes -= (oe -ns + 1);
       dout(10) << __func__ << " prev_idx " << dendl;
       frag_list.push_back(prev_idx);
 //      omap->index_map.insert(make_pair(prev_idx.ooff, prev_idx));
@@ -3599,7 +3671,7 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
       dout(10) << __func__ << " partial left match " << dendl;
       post_idx.ooff -= (ne - os + 1);
       post_idx.foff -= (ne - os + 1);
-      post_idx.used_bytes -= (ne - os + 1); 
+      post_idx.bytes -= (ne - os + 1); 
       frag_list.push_back(post_idx);
       dout(10) << __func__ << " post_idx " << dendl;
       //omap->index_map.insert(make_pair(post_idx.ooff, post_idx));
@@ -3612,12 +3684,12 @@ int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const 
 //delete_index:
   dout(10) << __func__ << " delete_list " << delete_list.size() << dendl;
 
-  for(list<off_t>::iterator p = delete_list.begin(); p != delete_list.end() ; p++){
+  for(list<uint64_t>::iterator p = delete_list.begin(); p != delete_list.end() ; p++){
     dout(10) << __func__ << " delete : " << *p << dendl;
     omap->index_map.erase(*p);
   }
 
-insert_partial_index:
+//insert_partial_index:
   dout(10) << __func__ << " partial_list " << frag_list.size() << dendl;
 
   for(list<buddy_index_t>::iterator p = frag_list.begin();
@@ -3632,7 +3704,7 @@ insert_new_index:
   omap->index_map.insert(make_pair(ooff, (*nidx)));
 
 // for debugging... 
-  for(map<off_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
+  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
       tmp != omap->index_map.end() ; tmp++){
     dout(10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
   }
@@ -3640,7 +3712,7 @@ insert_new_index:
 }
 
 
-int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const off_t ooff, const ssize_t bytes, 
+int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, 
     vector<buddy_iov_t>& iov)
 {
 
@@ -3658,21 +3730,21 @@ int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const off
 
   // found map 
   buddy_index_map_t* omap = &omap_p->second;
-  map<off_t, buddy_index_t>::iterator p;
+  map<uint64_t, buddy_index_t>::iterator p;
 
   // for debugging... 
-  for(map<off_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
+  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
       tmp != omap->index_map.end() ; tmp++){
     ldout(cct, 10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
   }
 
-  ssize_t rbytes = bytes;
-  off_t soff = ooff;
-  off_t eoff = ooff + bytes;
-  off_t foff = 0;
-  ssize_t fbytes = 0;
+  uint64_t rbytes = bytes;
+  uint64_t soff = ooff;
+  uint64_t eoff = ooff + bytes;
+  uint64_t foff = 0;
+  uint64_t fbytes = 0;
   uint64_t falloc_bytes = 0;
-  off_t peoff = 0;
+  uint64_t peoff = 0;
 
   // search start first smaller offset that the target 
   p = omap->index_map.upper_bound(soff);
@@ -3684,17 +3756,21 @@ int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const off
 
   while(rbytes > 0) {
 
-    ldout(cct, 10) << __func__ << " rbytes = " << rbytes << " p.ooff " << p->second.ooff << " p.eoff " << p->second.ooff + p->second.used_bytes << dendl;
+    ldout(cct, 10) << __func__ << " rbytes = " << rbytes << " p.ooff " << p->second.ooff << " p.eoff " << p->second.ooff + p->second.bytes << dendl;
 
-    assert(soff >= p->second.ooff && soff <= (p->second.ooff + p->second.used_bytes));
+    assert(soff >= p->second.ooff && soff <= (p->second.ooff + p->second.bytes));
 
-    peoff = p->second.ooff + p->second.used_bytes;
+    peoff = p->second.ooff + p->second.bytes;
 
     foff = p->second.foff + (soff - p->second.ooff);
     fbytes = (peoff < eoff? peoff : eoff) - soff;
-    falloc_bytes = p->second.alloc_bytes; // 이건 맞는지 디버깅때 확인해야함.
+//    falloc_bytes = p->second.alloc_bytes; // 이건 맞는지 디버깅때 확인해야함.
 
-    buddy_iov_t* niov = new buddy_iov_t(cid, oid, "/mnt/buddystore/data_file.0", soff, ooff, foff, fbytes, falloc_bytes); 
+//  buddy_iov_t(const coll_t _cid, const ghobject_t& _oid, string _fn, uint64_t _src_off, uint64_t _ooff, uint64_t _foff, uint64_t _bytes) 
+
+
+    buddy_iov_t* niov = new buddy_iov_t(cid, oid, ooff, foff, fbytes, 0, soff); //falloc_bytes); 
+    //buddy_iov_t* niov = new buddy_iov_t(cid, oid, "/mnt/buddystore/data_file.0", soff, ooff, foff, fbytes); //falloc_bytes); 
     iov.push_back(*niov);
 
     rbytes -= fbytes;
@@ -3849,72 +3925,72 @@ void BuddyStore::data_write_thread_entry()
 
       dout(10) << __func__<< " go through items num " << items.size() << dendl;
 
-      for (list<OpSequencer*>::iterator it = items.begin();
-	  it != items.end();
-	  it++)
-      {
-	OpSequencer* osr = *it;
-	assert(osr != NULL);
-	Op* o = osr->pop_queue_data();
-	assert(o != NULL);
+	  for (list<OpSequencer*>::iterator it = items.begin();
+		  it != items.end();
+		  it++)
+	  {
+		OpSequencer* osr = *it;
+		assert(osr != NULL);
+		Op* o = osr->pop_queue_data();
+		assert(o != NULL);
 
-	dout(10) << __func__ << " pop: seq " << o->op << dendl;
-	assert(o->tls_iov.size() > 0);
-	  
-	for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
-	    iovp != o->tls_iov.end(); iovp++) {
+		dout(10) << __func__ << " pop: seq " << o->op << dendl;
+		assert(o->tls_iov.size() > 0);
 
-	  buddy_iov_t iov = *iovp;
-	  dout(10) << __func__ << " pop_node foff " << iov.foff << " alloc_bytes " << iov.alloc_bytes << dendl; 
-	  assert(iov.alloc_bytes == iov.data_bl.length());
-	  //assert(iov.bytes == iov.data_bl.length());
+		for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
+			iovp != o->tls_iov.end(); iovp++) {
 
-  
-	  // --- 
-	  // check a possibility of aggregation
-	  // -- 
-	  set<buddy_iov_t>::iterator r = aggr_iovec.lower_bound(iov);
+		  buddy_iov_t iov = *iovp;
 
-	  // 1. check prev_node
-	  if(r != aggr_iovec.begin()){
-	    --r;
-	    dout(10) << __func__ << " prev_node foff " << r->foff << " alloc_bytes " << r->alloc_bytes << dendl;
-	    if((r->foff + r->alloc_bytes) == iov.foff){
+		  // --- 
+		  // check a possibility of aggregation
+		  // -- 
+		  set<buddy_iov_t>::iterator r = aggr_iovec.lower_bound(iov);
 
-	      dout(10) << __func__ << " merged to prev node " << dendl;
+		  // 1. check prev_node
+		  if(r != aggr_iovec.begin()){
+			--r;
+			buddy_iov_t r_iov = (*r);
 
-	      // new data 
-	      bufferlist newdata;
-	      newdata.claim(iov.data_bl);
+			//if((r->foff + r->alloc_bytes) == iov.foff){
+			if((r_iov.get_alloc_eoff()) == iov.get_alloc_soff()){
 
-	      // creates a new vector 
-	      buddy_iov_t niov (*r);
-	      niov.data_bl.append(newdata);
+			  dout(10) << __func__ << " merged to prev node " << dendl;
 
-	      //niov.foff = iov.foff; 
-	      niov.alloc_bytes += iov.alloc_bytes;
-	      assert(niov.alloc_bytes == niov.data_bl.length());
+			  // new data 
+			  bufferlist newdata;
+			  newdata.claim(iov.data_bl);
 
-	      dout(10) << __func__ << niov << dendl;
-	      
-	      // erase and add 
-	      aggr_iovec.erase(r);
-	      aggr_iovec.insert(niov);
-	      
-	      //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
-    
-	      //r->data_bl.claim_prepend(iov.data_bl);
-	      //r->foff = so;
-	      //r->alloc_bytes += iov.alloc_bytes;
-	      continue;
-	    }
-	  }
+			  // creates a new vector 
+			  buddy_iov_t niov (*r);
+			  niov.data_bl.append(newdata);
+
+			  //niov.foff = iov.foff; 
+			  //niov.alloc_bytes += iov.alloc_bytes;
+			  //assert(niov.alloc_bytes == niov.data_bl.length());
+
+			  dout(10) << __func__ << niov << dendl;
+
+			  // erase and add 
+			  aggr_iovec.erase(r);
+			  aggr_iovec.insert(niov);
+
+			  //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
+
+			  //r->data_bl.claim_prepend(iov.data_bl);
+			  //r->foff = so;
+			  //r->alloc_bytes += iov.alloc_bytes;
+			  continue;
+			}
+		  }
 
 	  // 2. check next node 
 	  if(r != aggr_iovec.end()){
-	    dout(10) << __func__ << " next_node foff " << r->foff << " alloc_bytes " << r->alloc_bytes << dendl;
 
-	    if(r->foff == (iov.foff + iov.alloc_bytes)){	
+		buddy_iov_t r_iov = (*r);
+
+	    //if(r->foff == (iov.foff + iov.alloc_bytes)){	
+		if(iov.get_alloc_eoff() == r_iov.get_alloc_soff()) {
 	      dout(10) << __func__ << " merged to next node " << dendl;
 
 	      // new data 
@@ -3926,52 +4002,52 @@ void BuddyStore::data_write_thread_entry()
 	      niov.data_bl.claim_prepend(newdata);
 
 	      niov.foff = iov.foff;
-	      niov.alloc_bytes += iov.alloc_bytes;
+	     // niov.alloc_bytes += iov.alloc_bytes;
 
-	      assert(niov.alloc_bytes == niov.data_bl.length());
+		  //assert(niov.alloc_bytes == niov.data_bl.length());
 
-	      dout(10) << __func__ << niov << dendl;
-	      
-	      // erase and add 
-	      aggr_iovec.erase(r);
-	      aggr_iovec.insert(niov);
-	      
-	      //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
-    
-	      //r->data_bl.claim_prepend(iov.data_bl);
-	      //r->foff = so;
-	      //r->alloc_bytes += iov.alloc_bytes;
-	      continue;
-	    }
+		  dout(10) << __func__ << niov << dendl;
+
+		  // erase and add 
+		  aggr_iovec.erase(r);
+		  aggr_iovec.insert(niov);
+
+		  //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
+
+		  //r->data_bl.claim_prepend(iov.data_bl);
+		  //r->foff = so;
+		  //r->alloc_bytes += iov.alloc_bytes;
+		  continue;
+		}
 	  }
 
 	  // no aggregation 
 	  dout(10) << __func__ << " no aggregation " << dendl;
 	  aggr_iovec.insert(iov);
-      
-	} // end of iov for loop 
 
-	complete_items.push_back(make_pair(osr, o));
-      } // total_bl for items 
+		} // end of iov for loop 
+
+		complete_items.push_back(make_pair(osr, o));
+	  } // total_bl for items 
 
 
-      while(!items.empty()){
-	items.pop_front();
-      }
+	  while(!items.empty()){
+		items.pop_front();
+	  }
 
-      //--------------------------------
-      // 2. write buffers
-      dout(10) << __func__ << " aggr_iovec size " << aggr_iovec.size() << dendl;
+	  //--------------------------------
+	  // 2. write buffers
+	  dout(10) << __func__ << " aggr_iovec size " << aggr_iovec.size() << dendl;
 
-      for(set<buddy_iov_t>::iterator iovp = aggr_iovec.begin();
-	iovp != aggr_iovec.end();
-	iovp++)
+	  for(set<buddy_iov_t>::iterator iovp = aggr_iovec.begin();
+		  iovp != aggr_iovec.end();
+		  iovp++)
       {
 	  dout(10) << __func__ << " aggr_iovec: foff " << iovp->foff << " len " << iovp->data_bl.length() << dendl;
   
 	  buddy_iov_t iov = *iovp;
 
-	  assert(iov.alloc_bytes == iov.data_bl.length());
+	  assert(iov.get_alloc_bytes() == iov.data_bl.length());
 
 	  //---
 	  start = ceph_clock_now(); 
@@ -3980,6 +4056,8 @@ void BuddyStore::data_write_thread_entry()
 	    ret = data_file.write_fd(iov.data_bl, 0);
 	  else
 	    ret = data_file.write_fd(iov.data_bl, round_down(iov.foff));
+
+	  assert(ret >= 0);
 //------------------------ here: data_file.write() ---------------//
 
 
@@ -4024,74 +4102,74 @@ void BuddyStore::data_write_thread_entry()
       }
 
 //--------------------------------
-      // 3. finish 
-      for (list<pair<OpSequencer*, Op*>>::iterator it = complete_items.begin();
-	  it != complete_items.end();
-	  it++)
-      {
-	OpSequencer* osr = it->first;
-	Op* o = it->second;
-	  
-	int r = osr->dec_jcount(o->op);
+// 3. finish 
+	  for (list<pair<OpSequencer*, Op*>>::iterator it = complete_items.begin();
+		  it != complete_items.end();
+		  it++)
+	  {
+		OpSequencer* osr = it->first;
+		Op* o = it->second;
 
-	dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " completed " << "dec_jcount = " << r << dendl;
+		int r = osr->dec_jcount(o->op);
+
+		dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " completed " << "dec_jcount = " << r << dendl;
 
 
-	if (r == 0) {
+		if (r == 0) {
 
-	  op_wq_lock.Lock();
-	  queue_op(osr, o);
-	  op_wq_lock.Unlock();
-   
-	  // called with tp lock held
-	  data_op_queue_release_throttle(o);
+		  op_wq_lock.Lock();
+		  queue_op(osr, o);
+		  op_wq_lock.Unlock();
 
-	  // do ondisk completions async, to prevent any onreadable_sync completions
-	  // getting blocked behind an ondisk completion.
-	  if (o->ondisk) {
-	    Mutex::Locker locker(ondisk_finisher_lock);
-	    dout(20) << __func__ << " on finisher_queue" << dendl;
-	    ondisk_finisher.queue(o->ondisk);
-	    //ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
-	  }
+		  // called with tp lock held
+		  data_op_queue_release_throttle(o);
 
-	  list<Context*> to_queue;
-	  osr->dequeue_wait_ondisk(&to_queue);
+		  // do ondisk completions async, to prevent any onreadable_sync completions
+		  // getting blocked behind an ondisk completion.
+		  if (o->ondisk) {
+			Mutex::Locker locker(ondisk_finisher_lock);
+			dout(20) << __func__ << " on finisher_queue" << dendl;
+			ondisk_finisher.queue(o->ondisk);
+			//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
+		  }
 
-	  if (!to_queue.empty()) {
-	    Mutex::Locker locker(ondisk_finisher_lock);
-	    dout(20) << "to_queue is not empty" << dendl;
-	    ondisk_finisher.queue(to_queue);
-	    //ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
-	  }
+		  list<Context*> to_queue;
+		  osr->dequeue_wait_ondisk(&to_queue);
 
-	  lat = ceph_clock_now();
-	  lat -= o->start;
+		  if (!to_queue.empty()) {
+			Mutex::Locker locker(ondisk_finisher_lock);
+			dout(20) << "to_queue is not empty" << dendl;
+			ondisk_finisher.queue(to_queue);
+			//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
+		  }
 
-	  if (logger) {
-	    logger->tinc(l_buddystore_journal_all_latency, lat);
-	  }
-	  dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
+		  lat = ceph_clock_now();
+		  lat -= o->start;
 
-	} // end of if (r == 0) 
+		  if (logger) {
+			logger->tinc(l_buddystore_journal_all_latency, lat);
+		  }
+		  dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
 
-      }// end of for completion items 
+		} // end of if (r == 0) 
 
-      while(!complete_items.empty())
-	complete_items.pop_front();
+	  }// end of for completion items 
 
-      dout(10) << __func__ << " finish " << dendl;
+	  while(!complete_items.empty())
+		complete_items.pop_front();
 
-      dataq_lock.Lock();
+	  dout(10) << __func__ << " finish " << dendl;
 
-    } // end of while dataq_empty 
+	  dataq_lock.Lock();
 
-    dout(10) << __func__ << " dataq is empty " << dendl;
+		} // end of while dataq_empty 
 
-  } // end of while 1
+		dout(10) << __func__ << " dataq is empty " << dendl;
 
-  stop_data_write = false; 
-  dataq_lock.Unlock();
+	  } // end of while 1
+
+	  stop_data_write = false; 
+	  dataq_lock.Unlock();
   dout(10) << __func__ << " terminate " << dendl;
 }
 
@@ -4177,9 +4255,10 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
   Op *o = osr->peek_queue();
   apply_manager.op_apply_start(o->op);
 
-
   dout(5) << "_do_op " << o << " seq " << o->op << " " << *osr << "/" << osr->parent << " start" << dendl;
   int r = _do_transactions(o->tls, o->op, &handle);
+
+
   apply_manager.op_apply_finish(o->op);
   dout(10) << "_do_op " << o << " seq " << o->op << " r = " << r
 	   << ", finisher " << o->onreadable << " " << o->onreadable_sync << dendl;
@@ -4190,7 +4269,10 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
   // Update offset with a file for each object. 
   // -------------------
   // 인덱스 정보를 여기에서 업데이트 해줌. 
-
+#ifdef FILE_CONTAINER
+  r = file_container_map_update(o->tls_iov); 
+  assert(r == 0);
+#else
   for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
       iovp != o->tls_iov.end(); iovp++) {
       buddy_iov_t iov = *iovp; 
@@ -4201,6 +4283,7 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
       int r = c->data_file_insert_index(iov.oid, iov.ooff, iov.foff, iov.bytes);
       assert(r==0);
   } 
+#endif
 
   o->tls.clear();
 
@@ -4226,13 +4309,11 @@ void BuddyStore::_finish_op(OpSequencer *osr)
 #if 0
   // o 를 map 에 담아두고 
   early_applied_op.insert(o);
-
   for(set<Op* o>::iterator p = early_applied_op.begin();
       p != early_applied_op.end();
       p++)
   {
     if((*p) == last_applied_seq_thru + 1){
-
     }
   }
 #endif
@@ -4798,38 +4879,147 @@ void BuddyStore::dump_logger()
 
 void BuddyStore::meta_stat()
 {
-    //check object map size 
-    set<coll_t> collections;
-    for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
-       p != coll_map.end();
-       ++p) {
-      
-      uint64_t xattr_size = 0;
-      uint64_t omap_header_size = 0;
-      uint64_t omap_size = 0; 
+  //check object map size 
+  set<coll_t> collections;
+  for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
+	  p != coll_map.end();
+	  ++p) {
 
-      for (map<ghobject_t, ObjectRef>::iterator op = p->second->object_map.begin();
-	    op != p->second->object_map.end();
-	    op++){
-	    bufferlist bl;
-	    uint64_t size;
-	    ::encode(op->second->xattr, bl);
-	    dout(10) << __func__ << " xattr size " << bl.length() << dendl; 
-	    size = bl.length();
-	    xattr_size += bl.length();
+	uint64_t xattr_size = 0;
+	uint64_t omap_header_size = 0;
+	uint64_t omap_size = 0; 
 
-	    ::encode(op->second->omap_header, bl);
-	    dout(10) << __func__ << " omap_header size " << bl.length() - size << dendl; 
-	    size = bl.length();
-	    omap_header_size += (bl.length() - size);
+	for (map<ghobject_t, ObjectRef>::iterator op = p->second->object_map.begin();
+		op != p->second->object_map.end();
+		op++){
+	  bufferlist bl;
+	  uint64_t size;
+	  ::encode(op->second->xattr, bl);
+	  dout(20) << __func__ << " xattr size " << bl.length() << dendl; 
+	  size = bl.length();
+	  xattr_size += bl.length();
 
-	    ::encode(op->second->omap, bl);
-	    dout(10) << __func__ << " omap size " << bl.length() - size << dendl; 
-	    size = bl.length();
-	    omap_size += (bl.length() - size);
-      }
-    }
+	  ::encode(op->second->omap_header, bl);
+	  dout(20) << __func__ << " omap_header size " << bl.length() - size << dendl; 
+	  size = bl.length();
+	  omap_header_size += (bl.length() - size);
+
+	  ::encode(op->second->omap, bl);
+	  dout(20) << __func__ << " omap size " << bl.length() - size << dendl; 
+	  size = bl.length();
+	  omap_size += (bl.length() - size);
+	}
+  }
+}
+
+//---------------------------------------
+//
+//     FileContainer 
+//
+//---------------------------------------
+
+
+int BuddyStore::mkfc()
+{
+  // 메타데이터 파일 만들어야 할듯. 
+  new_file_container();
+  assert(fc != NULL);
+  return fc->mkfc();
+}
+
+// create container 
+void BuddyStore::new_file_container()
+{
+  fc = new FileContainer(cct, basedir, this);
+  return;
+}
+
+void BuddyStore::file_container_start()
+{
+  assert(fc != NULL);
+  fc->mount();
+
+}
+
+void BuddyStore::file_container_stop()
+{
+  fc->sync();
+  fc->umount();
+}
+
+int BuddyStore::file_container_map_update(vector<buddy_iov_t>& tls_iov)
+{
+  return fc->oxt_map_update(tls_iov);
+}
+
+//void BuddyStore::_finish_fcwrite(OpSequencer* osr, Op* o, Context* ondisk)
+void BuddyStore::_finish_fcwrite(OpSequencer* osr, Op* o)
+{
+  
+  //  utime_t lat = ceph_clock_now();
+  utime_t lat = ceph_clock_now();
+  lat -= o->start;
+
+  int r = osr->dec_jcount(o->op);
+  assert(r >= 0);
+
+  dout(10) << __func__ << " seq " << o->op << " jcount = " << r << dendl;  
+
+  if (r > 0)
+    return;
+
+  op_wq_lock.Lock();
+  queue_op(osr, o);
+  op_wq_lock.Unlock();
+
+  // do ondisk completions async, to prevent any onreadable_sync completions
+  // getting blocked behind an ondisk completion.
+  if (o->ondisk) {
+	Mutex::Locker locker(ondisk_finisher_lock);
+	dout(20) << __func__ << " on finisher_queue" << dendl;
+	ondisk_finisher.queue(o->ondisk);
+	//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
   }
 
+  list<Context*> to_queue;
+  osr->dequeue_wait_ondisk(&to_queue);
 
+  if (!to_queue.empty()) {
+	Mutex::Locker locker(ondisk_finisher_lock);
+	dout(20) << "to_queue is not empty" << dendl;
+	ondisk_finisher.queue(to_queue);
+	//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
+  }
 
+  lat = ceph_clock_now();
+  lat -= o->start;
+#if 0
+  if (logger) {
+	logger->tinc(l_buddystore_journal_all_latency, lat);
+  }
+#endif
+  dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
+}
+
+#if 0
+// submit op 
+//void BuddyStore::file_container_submit(vector<buddy_iov_t>& iov, 
+//  OpSequencer *osr, Context* onfcwrite, TrackedOpRef osd_op)   
+void BuddyStore::file_container_submit(vector<buddy_iov_t>& iov, 
+  Context* onfcwrite, TrackedOpRef osd_op)   
+{
+
+  Mutex::Locker l(fc_lock);
+
+  // 이건 여기에서 넣고 finisher 에서 뺴든가 
+  // 아님 아예 추가하지 말든가 
+  //osr->queue_data(o);
+
+  //Op* o = osr->pop_queue_data();
+  assert(o->tls_iov.size() > 0);
+
+  //submit_entry(vector<buddy_iov_t>& iov, Context *onwrite, TrackedOpRef osd_op = TrackedOpRef());
+  fc->submit_entry(iov, onfcwrite, osd_op);
+
+}
+#endif

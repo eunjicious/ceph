@@ -34,13 +34,13 @@ class BuddyLogDataFileObject {
     int type;
 
     int dfd;
-    off_t tail_off;
-	off_t total_pool_bytes;
-	off_t total_reserved_bytes;
-    off_t total_used_bytes;
-    off_t total_alloc_bytes;
-    off_t prealloc_bytes;
-    off_t prewrite_unit_bytes;
+    uint64_t tail_off;
+	uint64_t total_pool_bytes;
+	uint64_t total_reserved_bytes;
+    uint64_t total_used_bytes;
+    uint64_t total_alloc_bytes;
+    uint64_t prealloc_bytes;
+    uint64_t prewrite_unit_bytes;
 
     bool file_prewrite;
     bool file_prealloc; 
@@ -49,8 +49,8 @@ class BuddyLogDataFileObject {
 
 
 	Mutex slot_lock;
-	vector<ssize_t> slot_used_bytes;
-	vector<ssize_t> slot_limit_bytes;
+	vector<uint64_t> slot_used_bytes;
+	vector<uint64_t> slot_limit_bytes;
 
 	double get_slot_util(int i){
 
@@ -108,7 +108,7 @@ class BuddyLogDataFileObject {
     Mutex lock; 
     //RWLock lock; // log_index_map lock 
     //map<ghobject_t, buddy_index_map_t> log_index_map;
-    map<off_t, ssize_t> free_index_map; // foff. not ooff!!!!
+    map<uint64_t, uint64_t> free_index_map; // foff. not ooff!!!!
 
     int create_or_open_file(int flag);
     int delete_file();
@@ -116,24 +116,24 @@ class BuddyLogDataFileObject {
     void stat_file();
 	void _stat_file();
 
-    int alloc_space(coll_t cid, const ghobject_t& oid, const off_t ooff, const ssize_t bytes, 
+    int alloc_space(coll_t cid, const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, 
       vector<buddy_iov_t>& iov);
-    //int get_space_info(const ghobject_t& oid, const off_t ooff, const ssize_t bytes,
+    //int get_space_info(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes,
      //  vector<buddy_iov_t>& iov);
     // @return: -1 on fail 
 
     int release_space(const buddy_index_map_t& omap); 
 
-    int truncate_space(const ghobject_t& oid, ssize_t size) {return 0;}
+    int truncate_space(const ghobject_t& oid, uint64_t size) {return 0;}
     int clone_space(const ghobject_t& ooid, const ghobject_t& noid, vector<buddy_iov_t>& iov){return 0;}
-    int clone_space(const ghobject_t& ooid, const ghobject_t& noid, off_t srcoff, size_t bytes, 
-	off_t dstoff, vector<buddy_iov_t>& iov) {return 0;}
+    int clone_space(const ghobject_t& ooid, const ghobject_t& noid, uint64_t srcoff, size_t bytes, 
+	uint64_t dstoff, vector<buddy_iov_t>& iov) {return 0;}
 //    int write(bufferlist& bl, uint64_t foff);
     int write_fd(bufferlist& bl, uint64_t foff);
 //    int write_fd(bufferlist& bl, uint64_t foff, int fd);
     void sync();
 
-    //int read_fd(const ghobject_t& oid, bufferlist& bl, uint64_t foff, ssize_t size);
+    //int read_fd(const ghobject_t& oid, bufferlist& bl, uint64_t foff, uint64_t size);
     int read(bufferlist& bl, uint64_t foff, size_t size);
     int read_fd(bufferlist& bl, uint64_t foff, size_t size);
     int read_fd(bufferlist& bl, uint64_t foff, size_t size, int fd);
