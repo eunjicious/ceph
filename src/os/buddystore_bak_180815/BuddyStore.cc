@@ -227,10 +227,8 @@ int BuddyStore::mount()
 {
   dout(5) << __func__ << dendl;
 
-#ifndef FILE_CONTAINER
   // -- data file -- 
   data_file.create_or_open_file(0);
-#endif
 
   int r = _load();
   if (r < 0)
@@ -376,14 +374,8 @@ int BuddyStore::umount()
   // check dataq 
   assert(dataq.empty());
 
-
-#ifdef FILE_CONTAINER
-  if(fc) 
-	fc->sync();
-#else
   // sync data file 
   data_file.sync();
-#endif
 
   // index_write_thread  
   do_force_sync();
@@ -794,29 +786,27 @@ void BuddyStore::index_write_thread_entry()
 
     // list 에 lock 안걸고 가져와서 하려면 swap 쓰면 됨. 
     // list.swap() 
+  
+    if(apply_manager.commit_start()) {
+      // committing_seq setting 
+      uint64_t cp = apply_manager.get_committing_seq();
+      last_checkpointed_seq = cp;
+    
+      apply_manager.commit_started();
 
-	if(apply_manager.commit_start()) {
-	  // committing_seq setting 
-	  uint64_t cp = apply_manager.get_committing_seq();
-	  last_checkpointed_seq = cp;
-	  apply_manager.commit_started();
-#ifdef FILE_CONTAINER
-	  if(fc) fc->sync();
-#else
-	  index_write_sync();
-#endif
+      index_write_sync();
 
-	  // kvmap sync
-	  if (kvmap_exist){
-		int r = object_kvmap->sync();	
-		if (r < 0) {
-		  dout(10) << " object_kvmap sync got " << cpp_strerror(r) << dendl;
-		  assert(0 == "object_kvmap sync returned error");
-		}
-	  }
-
-	  apply_manager.commit_finish();
+      // kvmap sync
+      if (kvmap_exist){
+  	int r = object_kvmap->sync();	
+	if (r < 0) {
+	  dout(10) << " object_kvmap sync got " << cpp_strerror(r) << dendl;
+	  assert(0 == "object_kvmap sync returned error");
 	}
+      }
+
+      apply_manager.commit_finish();
+    }
 
     meta_stat();
 
@@ -841,17 +831,23 @@ void BuddyStore::index_write_thread_entry()
 
 int BuddyStore::index_write_sync()
 {
-
-#ifndef FILE_CONTAINER
   dout(10) << __func__ << dendl;
 
   bufferlist bl;
+
   for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
        p != coll_map.end();
        ++p) {
     p->second->encode_index(bl);
   }
+
   dout(5) << __func__ << " index write size = " << bl.length() << " B " << (bl.length()/ 1048576) << " MB " <<  dendl;
+
+  ////////////////////////////
+  //
+  // write index to file 
+  //
+  ////////////////////////////
 
   string fn = path + "/" + "log_data_file.index";
 
@@ -900,9 +896,6 @@ int BuddyStore::index_write_sync()
   }
 
   return r;
-#else
-  return 0;
-#endif
 
 }
 
@@ -1034,14 +1027,7 @@ int BuddyStore::read(
   // load data when data_hold_in_memory is unset 
   //if(ret < static_cast<int>(len)) {
   if(!data_hold_in_memory && debug_file_read && data_flush) {
-#ifdef FILE_CONTAINER
-	bufferlist mbl;
-	ret = fc->read(c->cid, oid, offset, len, mbl);
-	bl.claim(mbl);
 
-	// test needed
-	return ret;
-#else
     bufferlist fbl;
 
     vector<buddy_iov_t> iov;
@@ -1096,7 +1082,6 @@ int BuddyStore::read(
     } else {
       bl.claim(fbl);
     }
-#endif
   }
 
   return ret;
@@ -1935,12 +1920,23 @@ int BuddyStore::generate_iov(vector<Transaction>& tls, vector<buddy_iov_t>& tls_
 		assert((*ip).get_alloc_bytes() == (*ip).data_bl.length());
 		dout(10) << op_iov << dendl;
 
+#if 0
+		// test
+		bufferlist::iterator dp = (*ip).data_bl.begin();
+		const char *dptr;
+		dp.get_ptr_and_advance(10, &dptr);
+		for(i=0; i<10; i++) 
+		  dout(10) << __func__ << " after " << *(dptr+i) << dendl;
+#endif
 	  }
 	  // tls_iov 는 실제 write_thread 가 file 에 io 할 때 쓰는 정보임. 
 	  tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
 
-	  vector<Transaction::iov_t> tmp_iov;
 
+	  // transaction 에서 저장하는 건 좀 더 simple 한 형태로 저장. 
+	  // 이 정보가 journal 에 적히게 됨. 
+	  // 이 정보를 저장해줘야 함. 
+	  vector<Transaction::iov_t> tmp_iov;
 	  for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
 		  iovp != op_iov.end(); ++iovp) {
 
@@ -2485,9 +2481,6 @@ int BuddyStore::_remove(const coll_t& cid, const ghobject_t& oid, const Sequence
     c->object_hash.erase(i);
     c->object_map.erase(oid);
 
-#ifdef FILE_CONTAINER
-	fc->remove(cid, oid); 
-#else
     // release space 
     auto p = c->data_file_index_map.find(oid); 
     if (p == c->data_file_index_map.end()) {
@@ -2502,7 +2495,6 @@ int BuddyStore::_remove(const coll_t& cid, const ghobject_t& oid, const Sequence
       return 0;
     }
     c->data_file_index_map.erase(oid);
-#endif
     
     // remove set attr, omap key
     if (!kvmap_exist)
@@ -3497,22 +3489,22 @@ int BuddyStore::PageSetObject::truncate(uint64_t size)
 
 void BuddyStore::Collection::encode(bufferlist& bl) const {
 
-  ENCODE_START(1, 1, bl);
-  ::encode(xattr, bl);
-  uint64_t size = bl.length();
-  dout(5) << __func__ << " xattr encode " << size << dendl;
-  ::encode(use_page_set, bl);
-  uint32_t s = object_map.size();
-  ::encode(s, bl);
-  dout(5) << __func__ << " object_map encode " << bl.length() - size << dendl;
-  size = bl.length();
+      ENCODE_START(1, 1, bl);
+      ::encode(xattr, bl);
+      uint64_t size = bl.length();
+      dout(5) << __func__ << " xattr encode " << size << dendl;
+      ::encode(use_page_set, bl);
+      uint32_t s = object_map.size();
+      ::encode(s, bl);
+      dout(5) << __func__ << " object_map encode " << bl.length() - size << dendl;
+      size = bl.length();
 
-  uint64_t gobject_encode_size = 0;
-  uint64_t object_encode_base_size = 0;
-
-  for (map<ghobject_t, ObjectRef>::const_iterator p = object_map.begin();
-	  p != object_map.end();
-	  ++p) {
+      uint64_t gobject_encode_size = 0;
+      uint64_t object_encode_base_size = 0;
+       
+      for (map<ghobject_t, ObjectRef>::const_iterator p = object_map.begin();
+	   p != object_map.end();
+	   ++p) {
 	uint64_t len = bl.length();
 	::encode(p->first, bl);
 	gobject_encode_size += (bl.length() - len);
@@ -3520,40 +3512,36 @@ void BuddyStore::Collection::encode(bufferlist& bl) const {
 
 	p->second->encode(bl);
 	object_encode_base_size += (bl.length() - len);
-  }
-  dout(5) << __func__ << " object encode " << bl.length() - size << dendl;
-  dout(5) << __func__ << " gobject encode " << gobject_encode_size << dendl;
-  dout(5) << __func__ << " object encode_base " << object_encode_base_size << dendl;
-  size = bl.length();
+      }
+      dout(5) << __func__ << " object encode " << bl.length() - size << dendl;
+      dout(5) << __func__ << " gobject encode " << gobject_encode_size << dendl;
+      dout(5) << __func__ << " object encode_base " << object_encode_base_size << dendl;
+      size = bl.length();
 
-#ifndef FILE_CONTAINER
-  // Eunji: here.. it's doing ..
-  ::encode(data_file_index_map, bl);
-#endif
+      // Eunji: here.. it's doing ..
+      ::encode(data_file_index_map, bl);
 
-  dout(5) << __func__ << " index encode " << bl.length() - size << dendl;
-  size = bl.length();
-  ENCODE_FINISH(bl);
+      dout(5) << __func__ << " index encode " << bl.length() - size << dendl;
+      size = bl.length();
+      ENCODE_FINISH(bl);
 }
-
+    
 void BuddyStore::Collection::decode(bufferlist::iterator& p) {
-  DECODE_START(1, p);
-  ::decode(xattr, p);
-  ::decode(use_page_set, p);
-  uint32_t s;
-  ::decode(s, p);
-  while (s--) {
+      DECODE_START(1, p);
+      ::decode(xattr, p);
+      ::decode(use_page_set, p);
+      uint32_t s;
+      ::decode(s, p);
+      while (s--) {
 	ghobject_t k;
 	::decode(k, p);
 	auto o = create_object();
 	o->decode(p);
 	object_map.insert(make_pair(k, o));
 	object_hash.insert(make_pair(k, o));
-  }
-#ifndef FILE_CONTAINER
-  ::decode(data_file_index_map, p);
-#endif
-  DECODE_FINISH(p);
+      }
+      ::decode(data_file_index_map, p);
+      DECODE_FINISH(p);
 }
 
 
@@ -3564,9 +3552,6 @@ BuddyStore::ObjectRef BuddyStore::Collection::create_object() const {
   //  return new PageSetObject(cct->_conf->buddystore_page_size);
   return new BufferlistObject(cct, cct->_conf->buddystore_data_hold_in_memory);
 }
-
-
-#ifndef FILE_CONTAINER
 
 // EUNJI 
 /****************************************/
@@ -3799,7 +3784,6 @@ int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const uin
 
   return 0;
 }
-#endif
 
 ////--------------------
 
@@ -4286,7 +4270,7 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
   // -------------------
   // 인덱스 정보를 여기에서 업데이트 해줌. 
 #ifdef FILE_CONTAINER
-  r = fc->oxt_map_update(o->tls_iov); 
+  r = file_container_map_update(o->tls_iov); 
   assert(r == 0);
 #else
   for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
@@ -4963,12 +4947,10 @@ void BuddyStore::file_container_stop()
   fc->umount();
 }
 
-#if 0
 int BuddyStore::file_container_map_update(vector<buddy_iov_t>& tls_iov)
 {
   return fc->oxt_map_update(tls_iov);
 }
-#endif
 
 //void BuddyStore::_finish_fcwrite(OpSequencer* osr, Op* o, Context* ondisk)
 void BuddyStore::_finish_fcwrite(OpSequencer* osr, Op* o)

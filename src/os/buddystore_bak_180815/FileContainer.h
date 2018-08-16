@@ -15,8 +15,6 @@
 #include "buddy_types.h"
 #include "os/ObjectStore.h"
 
-#define SYS_PREFIX "sys_prefix"
-#define SYS_KEY "sys_key"
 
 // FileContainer 는 write thread 가 돌면서 writeq 에 들어온 request 를 처리함. 
 // buddy_iov_t 형태로 들어온 request 임. 
@@ -235,14 +233,14 @@ public:
 
   int oxt_map_update (vector<buddy_iov_t>& iov);
   int oxt_map_single_update(buddy_iov_t& iov);
-  int oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint64_t off, uint64_t len, vector<buddy_iov_t>& iov);
+  int oxt_map_lookup(coll_t& cid, ghobject_t& oid, uint64_t off, uint64_t len, vector<buddy_iov_t>& iov);
 
-  int sync(); 
+  int sync() {return 0;}
+  
   // object operations 
   size_t get_size(ghobject_t& oid);
-  int read(const coll_t& cid, const ghobject_t& oid, uint64_t offset, uint64_t len, bufferlist &bl);
-  int remove(const coll_t& cid, const ghobject_t& oid);
-  int write(uint64_t offset, const bufferlist &bl){return 0;};
+  int read(coll_t& cid, ghobject_t& oid, uint64_t offset, uint64_t len, bufferlist &bl);
+  //int write(uint64_t offset, const bufferlist &bl) = 0;
   //int clone(ghobject_t& src, ghobject_t& dest, uint64_t srcoff, uint64_t len, uint64_t dstoff) {};
   //int truncate(ghobject_t& oid, uint64_t offset) {};
 

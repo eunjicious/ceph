@@ -522,6 +522,7 @@ public:
     vector<Op> punch_hole_ops;
     struct iov_t {
       string fname;
+	  uint64_t 
       uint64_t foff;
       uint64_t bytes;
       //uint64_t tot_bytes;

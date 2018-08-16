@@ -174,14 +174,12 @@ public:
     int bits;
     CephContext *cct;
 
-#ifndef FILE_CONTAINER
     // -- data_file_map --
     // 사실 이게.. buddy_index_map_t 를 Object 에 넣으면 되는건데
     map<ghobject_t, buddy_index_map_t> data_file_index_map; // data_file_index_map  
 
     int data_file_insert_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t foff, const uint64_t bytes); 
     int data_file_get_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, vector<buddy_iov_t>& iov);
-#endif
 
     bool use_page_set;
     bool data_hold_in_memory;
@@ -222,7 +220,7 @@ public:
       return result.first->second; // 있는 경우에는 그냥 있는거 return. 그걸 바꿔치기 한거니까. 
     }
 
-#ifndef FILE_CONTAINER
+
     void encode_index(bufferlist& bl) const {
       ENCODE_START(1, 1, bl);
       ::encode(data_file_index_map, bl);
@@ -233,7 +231,6 @@ public:
       ::decode(data_file_index_map, p);
       DECODE_FINISH(p);
     }
-#endif
 
     void encode(bufferlist& bl) const;
     void decode(bufferlist::iterator& p);

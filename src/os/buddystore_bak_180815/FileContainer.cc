@@ -808,7 +808,7 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
 }
 
 // oxt_map_lookup 
-int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint64_t ooff, uint64_t len, vector<buddy_iov_t>& iov)
+int FileContainer::oxt_map_lookup(coll_t& cid, ghobject_t& oid, uint64_t ooff, uint64_t len, vector<buddy_iov_t>& iov)
 {
   // 실제 이 lookup 함수가 불리는 건 data 를 read 할때.  oxt_map 에 새로운
   // entry 를 넣을 때는 기존의 entry 를 읽기는 하는데 어차피 entry 만 읽어서
@@ -874,22 +874,7 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   return 0;
 }
 
-int FileContainer::sync()
-{
-  assert(directio);
-  KeyValueDB::Transaction t = oxt_map_db->get_transaction();
 
-  bufferlist bl;
-
-  {
-	Mutex::Locker l(fc_lock);
-	::encode(file_seq, bl);
-	map<string, bufferlist> to_write;
-	to_write[SYS_KEY] = bl;
-	t->set(SYS_PREFIX, to_write);
-  }
-  return oxt_map_db->submit_transaction_sync(t);
-}
 
 size_t FileContainer::get_size(ghobject_t& oid)
 {
@@ -898,7 +883,7 @@ size_t FileContainer::get_size(ghobject_t& oid)
 
 
 //---- read -----// 
-int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, uint64_t len, bufferlist &bl)
+int FileContainer::read(coll_t& cid, ghobject_t& oid, uint64_t off, uint64_t len, bufferlist &bl)
 {
   // map 정보 읽어와서 실제 bl 에 담아주면 됨. 
   vector<buddy_iov_t> iov;
@@ -924,28 +909,6 @@ int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, 
   dout(3) << __func__ << " requested: " << len << " read: " << bl.length() << dendl;
   return bl.length();
 }
-
-
-//---- remove -----// 
-int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
-{
-  dout(3) << __func__ << dendl;
-  // get oxt map 
-  map<uint64_t, buddy_iov_t> omap;  
-
-  string prefix = cid.to_str(); 
-  string key = ghobject_key(oid);
-
-  // 사실은 여기에서 free_extent_map 에 넣어야 함. 읽어와서. 
-  // YUIL
-
-  if(oxt_map_db){
-	KeyValueDB::Transaction t = oxt_map_db->get_transaction(); 
-	t->rmkey(prefix, key);	
-  }
-  return 0;
-}
-
 
 
 

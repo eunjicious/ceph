@@ -179,14 +179,9 @@ void FileContainer::mount()
   }
   dout(3) << "Success open oxt_map" << dendl;
 
-  // start finisher 
-  fc_finisher.start();
- 
   // start_writer
   write_stop = false;
   write_thread.create("fc_writer");
-
- 
 }
 
 //----- umount ----//
@@ -197,22 +192,7 @@ void FileContainer::umount()
   // close files 
   _close_file_all();
 
-  // wait finisher 
-  { 
-	Mutex::Locker l(fc_finisher_lock);
-	while(!completions.empty()){
-	  dout(3) << "waiting for completions empty" << dendl;
-	  fc_finisher_cond.Wait(fc_finisher_lock);
-	}
-  }
-
-  dout(3) << "flush waiting for fc_finisher" << dendl; 
-  fc_finisher.wait_for_empty();
-  fc_finisher.stop();
-  dout(3) << "flush done" << dendl; 
-
   // stop writer 
-  // 얘가 처리를 하고 finisher_cond.Signal() 을 부르기 때문에 먼저 죽으면 안됨. 
   if (!write_stop) {
 	Mutex::Locker l(writeq_lock);
 	write_stop = true;
@@ -220,6 +200,19 @@ void FileContainer::umount()
   }
   write_thread.join();
 
+  // wait finisher 
+  { 
+	Mutex::Locker l(finisher_lock);
+	while(!completions.empty()){
+	  dout(3) << "waiting for completions empty" << dendl;
+	  finisher_cond.Wait(finisher_lock);
+	}
+  }
+
+  dout(3) << "flush waiting for finisher" << dendl; 
+  finisher.wait_for_empty();
+  dout(3) << "flush done" << dendl; 
+  
   // store 
   _save();
 
@@ -266,12 +259,11 @@ int FileContainer::_write(buddy_iov_t& iov)
   string fname = prefix_fn + to_string(iov.file_seq);
   
   int fd = _create_or_open_file(fname, O_DIRECT | O_DSYNC | O_CREAT);
-  dout(3) << __func__ << " fname " << fname << " fd " << fd << dendl;
 
   // 어차피 bl 에 있는거 쓰게 되어 있음. 
   int r = iov.data_bl.write_fd(fd, iov.foff); 
   if (r) {
-	dout(3) << __func__ << " Failed to write with " << r << dendl;
+	dout(3) << __func__ << "Error in write" << dendl;
 	return r;
   }
   return 0;
@@ -381,26 +373,16 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 		  ip != op_iov.end(); ++ip){
 
 		bufferlist newdata;
-		newdata.append_zero((*ip).foff - (*ip).get_alloc_soff());
 
-		dout(3) << " punch_hole_off " << punch_hole_off << dendl;
-		dout(3) << " data_start_off " << data_start_off << dendl;
-		dout(3) << " foff " << (*ip).foff << dendl;
-		dout(3) << " get_alloc_soff " << (*ip).get_alloc_soff() << dendl;
-		dout(3) << " newdata length " << newdata.length() << dendl;
+		newdata.append_zero((*ip).foff - (*ip).get_alloc_soff());
 		
 		// copy data from transactions' bl 
 		newdata.substr_of(
 		  tr.data_bl, 
 		  data_start_off + (*ip).src_off, 
 		  (*ip).bytes);
-
-		dout(3) << " newdata length " << newdata.length() << dendl;
 		
 		newdata.append_zero((*ip).get_alloc_bytes() - newdata.length());
-
-		dout(3) << " get_alloc_bytes " << (*ip).get_alloc_bytes() << dendl;
-		dout(3) << " newdata length " << newdata.length() << dendl;
 
 		(*ip).data_bl.claim(newdata);
 
@@ -444,14 +426,9 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 //----- submit_entry ----//
 void FileContainer::submit_entry(uint64_t seq, vector<buddy_iov_t>& iov, Context* onfcwrite, TrackedOpRef osd_op) 
 {
-  dout(3) << __func__ << " seq " << seq << dendl;
-
-  // for debug 
-  for(auto p = iov.begin(); p != iov.end(); ++p)
-	dout(3) << __func__ << " iov " << (*p) << dendl;
-
-  Mutex::Locker l2(writeq_lock);
+  dout(3) << __func__ << dendl;
   Mutex::Locker l1(completions_lock);
+  Mutex::Locker l2(writeq_lock);
 
   completions.push_back(
 	  completion_item(seq, onfcwrite, ceph_clock_now(), osd_op));
@@ -459,11 +436,8 @@ void FileContainer::submit_entry(uint64_t seq, vector<buddy_iov_t>& iov, Context
   if (writeq.empty())
 	writeq_cond.Signal();
   writeq.push_back(write_item(seq, iov, osd_op));
-
-
 }
 
-#if 0
 void FileContainer::merge_write()
 {
 		for(vector<buddy_iov_t>::iterator iovp = it->iov.begin();
@@ -540,7 +514,6 @@ void FileContainer::merge_write()
 
 
 }
-#endif
 //----- write_thread_entry -----//
 void FileContainer::write_thread_entry()
 {
@@ -566,26 +539,24 @@ void FileContainer::write_thread_entry()
 	  list<write_item> items;
 	  // new buddy_iov_t list 
 	  set<buddy_iov_t> aggr_iovec;
-	  writeq.swap(items); // if alread locked 
-	  //batch_pop_writeq(items); // this will get a lock inside  
+	  writeq.swap(items);
+	  //batch_pop_writeq(items);
 	  writeq_lock.Unlock(); // ---- unlock here!  
 
 	  dout(3) << __func__<< " writeq_items = " << items.size() << dendl;
 
 	  for (list<write_item>::iterator it = items.begin();
-		  it != items.end(); ++it) {
+		  it != items.end(); it++) {
 
 		for(vector<buddy_iov_t>::iterator iovp = it->iov.begin();
 			iovp != it->iov.end(); iovp++) {
 
 		  aggr_iovec.insert(*iovp);
+		  { 
+			Mutex::Locker l(finisher_lock);
+			writing_seq = writing_seq < it->seq? it->seq : writing_seq;
+		  }
 		} // total_bl for items 
-
-		fc_finisher_lock.Lock();
-		writing_seq = writing_seq < it->seq? it->seq : writing_seq;
-		fc_finisher_lock.Unlock();
-
-		dout(3) << __func__ << " writing_seq = " << writing_seq << " it->seq " << it->seq << dendl;
 	  }
 
 	  while(!items.empty()){
@@ -605,8 +576,21 @@ void FileContainer::write_thread_entry()
 		buddy_iov_t iov = *iovp;
 		start = ceph_clock_now(); 
 
-		// 이거 나중에 풀기 
-		//int ret = _write(iov);
+		//int ret = data_file.write_fd(iov.data_bl, round_down(iov.foff));
+		int ret = _write(iov);
+
+		//------------------------ here: data_file.write() ---------------//
+#if 0
+		// verification 
+		bufferlist read_bl;
+		ret = data_file.read_fd(read_bl, round_down(iov.foff), iov.data_bl.length());
+
+		if(read_bl.contents_equal(iov.data_bl))
+		  dout(3) << __func__ << "write_verify: equal " << dendl;
+		else
+		  dout(3) << __func__ << "write_verify: not equal " << dendl;
+		//assert(ret == 0);
+#endif
 
 		lat = ceph_clock_now();
 		lat -= start;
@@ -615,13 +599,13 @@ void FileContainer::write_thread_entry()
 
 	  writeq_lock.Lock();
 	  {
-		Mutex::Locker l(fc_finisher_lock);
+		Mutex::Locker l(finisher_lock);
 		written_seq = writing_seq;
 		queue_completions_thru(written_seq);
 	  }
-	} // end of while writeq_empty 
 
-  } // end of while(!write_stop)
+	} // end of while writeq_empty 
+  } // end of while 1
 
   write_stop = false; 
   writeq_lock.Unlock();
@@ -632,8 +616,8 @@ void FileContainer::write_thread_entry()
 // Context 를 write_item 으로 받아서 바로 위에서 해줘도 될 거 같은데 
 void FileContainer::queue_completions_thru(uint64_t seq)
 {
-  dout(3) << __func__ << " seq " << seq << dendl;
-  assert(fc_finisher_lock.is_locked());
+  dout(3) << __func__ << dendl;
+  assert(finisher_lock.is_locked());
   utime_t now = ceph_clock_now();
   list<completion_item> items;
   batch_pop_completions(items);
@@ -641,12 +625,9 @@ void FileContainer::queue_completions_thru(uint64_t seq)
 
   dout(3) << __func__ << " completions_item = " << items.size() << dendl;
   while (it != items.end()) {
-	dout(3) << __func__ << " queueing start " << dendl;
     completion_item& next = *it;
-    if (next.seq > seq){
-	  dout(3) << __func__ << " next seq " << next.seq << dendl;
+    if (next.seq > seq)
       break;
-	}
     utime_t lat = now;
     lat -= next.start;
     dout(3) << "queue_completions_thru seq " << seq
@@ -655,21 +636,22 @@ void FileContainer::queue_completions_thru(uint64_t seq)
 	     << " lat " << lat << dendl;
 
     assert(next.finish);
+
     if (next.finish){
       dout(3) << __func__ << " finisher_queue seq = " << seq << dendl;
-      fc_finisher.queue(next.finish);
+      finisher.queue(next.finish);
     }
-#if 0
+//    if (next.finish)
+//      finisher->queue(next.finish);
 //    if (next.tracked_op)
 //      next.tracked_op->mark_event("journaled_completion_queued");
-#endif
     items.erase(it++);
   }
 
   batch_unpop_completions(items);
 
   dout(3) << __func__ << " wake up finisher " << dendl;
-  fc_finisher_cond.Signal();
+  finisher_cond.Signal();
 }
 
 
@@ -686,7 +668,6 @@ int FileContainer::oxt_map_update(vector<buddy_iov_t>& iov)
 	  return r;
 	}
   }
-  return 0;
 }
 
 int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
@@ -808,7 +789,7 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
 }
 
 // oxt_map_lookup 
-int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint64_t ooff, uint64_t len, vector<buddy_iov_t>& iov)
+int FileContainer::oxt_map_lookup(coll_t& cid, ghobject_t& oid, uint64_t ooff, uint64_t len, vector<buddy_iov_t>& iov)
 {
   // 실제 이 lookup 함수가 불리는 건 data 를 read 할때.  oxt_map 에 새로운
   // entry 를 넣을 때는 기존의 entry 를 읽기는 하는데 어차피 entry 만 읽어서
@@ -874,22 +855,7 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   return 0;
 }
 
-int FileContainer::sync()
-{
-  assert(directio);
-  KeyValueDB::Transaction t = oxt_map_db->get_transaction();
 
-  bufferlist bl;
-
-  {
-	Mutex::Locker l(fc_lock);
-	::encode(file_seq, bl);
-	map<string, bufferlist> to_write;
-	to_write[SYS_KEY] = bl;
-	t->set(SYS_PREFIX, to_write);
-  }
-  return oxt_map_db->submit_transaction_sync(t);
-}
 
 size_t FileContainer::get_size(ghobject_t& oid)
 {
@@ -898,7 +864,7 @@ size_t FileContainer::get_size(ghobject_t& oid)
 
 
 //---- read -----// 
-int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, uint64_t len, bufferlist &bl)
+int FileContainer::read(coll_t& cid, ghobject_t& oid, uint64_t off, uint64_t len, bufferlist &bl)
 {
   // map 정보 읽어와서 실제 bl 에 담아주면 됨. 
   vector<buddy_iov_t> iov;
@@ -924,28 +890,6 @@ int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, 
   dout(3) << __func__ << " requested: " << len << " read: " << bl.length() << dendl;
   return bl.length();
 }
-
-
-//---- remove -----// 
-int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
-{
-  dout(3) << __func__ << dendl;
-  // get oxt map 
-  map<uint64_t, buddy_iov_t> omap;  
-
-  string prefix = cid.to_str(); 
-  string key = ghobject_key(oid);
-
-  // 사실은 여기에서 free_extent_map 에 넣어야 함. 읽어와서. 
-  // YUIL
-
-  if(oxt_map_db){
-	KeyValueDB::Transaction t = oxt_map_db->get_transaction(); 
-	t->rmkey(prefix, key);	
-  }
-  return 0;
-}
-
 
 
 
