@@ -50,8 +50,8 @@ BuddyStore::BuddyStore(CephContext *cct, const string& basedir_,
   basedir(basedir_),
  // journalpath(basedir_ + "/buddy.jnl"),
   journalpath("/dev/xvdb1"),
-  generic_flags(flags),
   fc_lock("BuddyStore::fc_lock"),
+  generic_flags(flags),
   logger(NULL),
   data_directio(cct->_conf->buddystore_data_directio), // default is true
   data_flush(cct->_conf->buddystore_data_flush),
@@ -59,9 +59,6 @@ BuddyStore::BuddyStore(CephContext *cct, const string& basedir_,
   data_hold_in_memory(cct->_conf->buddystore_data_hold_in_memory),
   file_prewrite(cct->_conf->buddystore_file_prewrite),
   file_inplace_write(cct->_conf->buddystore_file_inplace_write),
-  last_data_file_seq(0),
-  //data_file(cct, basedir_ + "/data_file.0"),
-  data_file(cct, path + "/data_file." + to_string(last_data_file_seq), data_directio, !file_prewrite),
   debug_file_read(true),
   last_checkpointed_seq(0),
   next_osr_id(0),
@@ -73,23 +70,15 @@ BuddyStore::BuddyStore(CephContext *cct, const string& basedir_,
   op_wq(this, cct->_conf->filestore_op_thread_timeout,
       cct->_conf->buddystore_op_thread_suicide_timeout, &op_tp),
   op_wq_lock("BuddyStore::op_wq_lock"),
-  data_op_tp(cct, "BuddyStore::data_op_tp", "tp_bdstore_dop", cct->_conf->buddystore_op_threads, "buddystore_op_threads"),
-  data_op_wq(this, cct->_conf->filestore_op_thread_timeout,
-      cct->_conf->buddystore_op_thread_suicide_timeout, &data_op_tp),
-  dataq_lock("BuddyStore::dataq_lock"),
-  data_write_thread(this),
-  stop_data_write(false),
-  index_write_thread(this),
-  index_write_lock("BuddyStore::index_write_lock"),
-  force_index_write(false),
-  stop_index_write(false),
-  m_buddystore_index_sync_interval(cct->_conf->buddystore_index_sync_inerval),
+  do_apply_thread(this),
+  do_apply_lock("BuddyStore::do_apply_lock"),
+  force_do_apply(false),
+  stop_do_apply(false),
+  m_buddystore_do_apply_interval(cct->_conf->buddystore_index_sync_inerval),
   omap_backend("leveldb"),
   omap_dir(basedir_ + "/omap_store"),
   kvmap_exist(true),
   do_upgrade(false),
-  //data_writeq_lock("BuddyStore::data_writeq_lock"),
-  //data_write_stop(true),
   coll_map_lock("BuddyStore::coll_map_lock"),
   //coll_file_lock("BuddyStore::coll_file_lock"),
   ondisk_finisher(cct),
@@ -227,11 +216,6 @@ int BuddyStore::mount()
 {
   dout(5) << __func__ << dendl;
 
-#ifndef FILE_CONTAINER
-  // -- data file -- 
-  data_file.create_or_open_file(0);
-#endif
-
   int r = _load();
   if (r < 0)
     return r;
@@ -262,26 +246,19 @@ int BuddyStore::mount()
   journal_start();
 
   op_tp.start();
-  data_op_tp.start();
 
 #ifdef FILE_CONTAINER
-  // file container 
   new_file_container();
   file_container_start();
 #endif
 
-  // index_write_thread 
-  index_write_thread.create("buddy_idx_wrt");
+  // do_apply_thread 
+  do_apply_thread.create("buddy_idx_wrt");
 
-  // data_write_thread
-  data_write_thread.create("buddy_dwrt");
 
   ////////////////////////////////////////
-  //
   //  object_kvmap 
-  //
-  // attr 랑 omap 저장할 db 만들기
-
+  ////////////////////////////////////////
 
   dout(0) << "start omap initiation" << dendl;
 
@@ -349,10 +326,10 @@ void BuddyStore::do_force_sync()
 {
   dout(10) << __func__ << dendl;
 
-  Mutex::Locker l(index_write_lock);
+  Mutex::Locker l(do_apply_lock);
 
-  force_index_write = true;
-  index_write_cond.Signal();
+  force_do_apply = true;
+  do_apply_cond.Signal();
 }
 
 
@@ -366,33 +343,19 @@ int BuddyStore::umount()
   // journal flush 
   journal->flush();
 
-  // data_write_thread
-  dataq_lock.Lock();
-  stop_data_write = true;
-  dataq_cond.Signal();
-  dataq_lock.Unlock();
-  data_write_thread.join();
-
-  // check dataq 
-  assert(dataq.empty());
-
-
 #ifdef FILE_CONTAINER
   if(fc) 
 	fc->sync();
-#else
-  // sync data file 
-  data_file.sync();
 #endif
 
-  // index_write_thread  
+  // do_apply_thread  
   do_force_sync();
 
-  index_write_lock.Lock();
-  stop_index_write = true;
-  index_write_cond.Signal();
-  index_write_lock.Unlock();
-  index_write_thread.join();
+  do_apply_lock.Lock();
+  stop_do_apply = true;
+  do_apply_cond.Signal();
+  do_apply_lock.Unlock();
+  do_apply_thread.join();
 
 #if 0
   // A commit refers to a checkpoint.  
@@ -413,12 +376,10 @@ int BuddyStore::umount()
     journal_write_close();
 
 #ifdef FILE_CONTAINER
-  // file container 
   file_container_stop();
 #endif
 
   op_tp.stop();
-  data_op_tp.stop();
 
   ondisk_finisher.wait_for_empty();
   ondisk_finisher.stop();
@@ -470,33 +431,6 @@ int BuddyStore::_save()
   int r = bl.write_file(fn.c_str());
   if (r < 0)
     return r;
-
-  // -- close data file -- 
-  struct stat st;
-  int sr = ::fstat(data_file.dfd, &st);
-  if (sr < 0) 
-    dout(10) << __func__ << " File is not open" << dendl; 
-  else
-    dout(10) << __func__ << " data_file size " << st.st_size << dendl;
-
-  data_file.close_file();
-
-  // -- last_data_file_seq -- 
-  dout(10) << __func__ << " last_data_file_seq " << last_data_file_seq << dendl;
-  fn = path + "/last_data_file_seq";
-  bufferlist dfbl;
-  ::encode(last_data_file_seq, dfbl);
-  r = dfbl.write_file(fn.c_str());
-  if (r < 0){
-    dout(10) << "Failed to write last_data_file seq " << dendl;
-    return r;
-  }
-
-  // -- save data_file meta -- 
-  fn = path + "/data_file." + to_string(last_data_file_seq) + ".meta";
-  bufferlist dfmbl;
-  data_file.encode(dfmbl);
-  r = dfmbl.write_file(fn.c_str());
 
   // -- last_checkpointed_seq -- 
   dout(10) << __func__ << " last_checkpointed_seq " << last_checkpointed_seq << dendl;
@@ -555,8 +489,6 @@ void BuddyStore::dump(Formatter *f)
       f->close_section();
     }
     f->close_section();
-
-    f->close_section();
   }
   f->close_section();
 }
@@ -588,23 +520,9 @@ int BuddyStore::_load()
     // collection decode 
     c->decode(p);
 
-#if 0
-#ifdef EUNJI
-    int exist = 0;
-    ::decode(exist, p);
-
-    if (exist) {
-      BuddyLogDataFileObject* datafile = new BuddyLogDataFileObject(cct, (*q), basedir + "/" + (*q).to_str() + ".data", data_directio, !file_prewrite);
-      //BuddyLogDataFileObject* datafile = new BuddyLogDataFileObject(cct, (*q), basedir + "/" + (*q).to_str() + ".data", data_directio);
-      datafile->decode(p); 
-      coll_file_map.insert(make_pair((*q), datafile));
-    }
-#endif
-#endif
     coll_map[*q] = c;
     used_bytes += c->used_bytes();
   }
-
 
   // -- last_checkpoint_seq -- 
   bufferlist cbl;
@@ -621,41 +539,6 @@ int BuddyStore::_load()
     ::decode(last_checkpointed_seq, p);
   }
   dout(10) << "read last_checkpointed_seq: " << last_checkpointed_seq << dendl;
-
-  // -- last_data_file_seq -- 
-  bufferlist dfbl;
-  fn = path + "/last_data_file_seq";
-  r = dfbl.read_file(fn.c_str(), &err);
-
-  if (r < 0) {
-    ::encode(last_data_file_seq, dfbl);
-    r = dfbl.write_file(fn.c_str());
-    if (r < 0) {
-      dout(10) << "Failed to write " << fn << dendl;
-    }
-  } else {
-    p = dfbl.begin();  
-    ::decode(last_data_file_seq, p);
-  }
-  dout(10) << "read last_data_file_seq: " << last_data_file_seq << dendl;
-
-  // -- data file --
-  bufferlist dfmbl;
-  fn = path + "/data_file." + to_string(last_data_file_seq) + ".meta";
-
-  r = dfmbl.read_file(fn.c_str(), &err);
-  if (r < 0) {
-    data_file.encode(dfmbl);
-    r = dfmbl.write_file(fn.c_str());
-    if (r < 0) {
-      dout(10) << "Failed to write " << fn << dendl;
-    }
-  } else {
-    p = dfmbl.begin();  
-    data_file.decode(p);
-    dout(10) << " read data file meta " << dendl;
-    data_file.stat_file();
-  }
 
   //dump_all();
 
@@ -730,12 +613,17 @@ int BuddyStore::statfs(struct store_statfs_t *st)
   st->total = cct->_conf->buddystore_device_bytes;
   st->available = MAX(int64_t(st->total) - int64_t(used_bytes), 0ll);
 
+#ifdef FILE_CONTAINER
+  st->allocated = fc->total_alloc_bytes; 
+  st->stored = fc->total_stored_bytes;
+#else
   st->allocated = data_file.total_alloc_bytes; 
-  st->stored = data_file.total_used_bytes;
+  st->stored = data_file.total_stored_bytes;
+#endif
 
   dout(10) << __func__ << ": used_bytes: " << used_bytes
 	   << "/" << cct->_conf->buddystore_device_bytes << dendl;
-  dout(10) << __func__ << " fpool_stored / alloc_bytes: " << st->stored 
+  dout(10) << __func__ << " fpool_stored / alloc_bytes: " << st->stored
 	   << "/" << st->allocated << dendl;
   return 0;
 }
@@ -761,28 +649,28 @@ BuddyStore::CollectionRef BuddyStore::get_collection(const coll_t& cid)
 //----------------------
 
 
-void BuddyStore::index_write_thread_entry()
+void BuddyStore::do_apply_thread_entry()
 {
   dout(10) << __func__ << dendl;
 
-  index_write_lock.Lock();
+  do_apply_lock.Lock();
 
   utime_t interval;
   interval.set_from_double(30.0);
 
-  while (!stop_index_write) {
+  while (!stop_do_apply) {
     utime_t startwait = ceph_clock_now();
 
-    if (!force_index_write) {
+    if (!force_do_apply) {
       dout(10) << __func__ << " waiting for interval " <<  interval << dendl;
-      index_write_cond.WaitInterval(index_write_lock, interval);
+      do_apply_cond.WaitInterval(do_apply_lock, interval);
     }
-    if (force_index_write) {
+    if (force_do_apply) {
       dout(10) << __func__ << " force_index_sync " << dendl;
-      force_index_write = false;
+      force_do_apply = false;
     }
-    if (stop_index_write) {
-      dout(10) << __func__ << " stop index_write_thread " << dendl;
+    if (stop_do_apply) {
+      dout(10) << __func__ << " stop do_apply_thread " << dendl;
       break;
     } else {
       utime_t woke = ceph_clock_now();
@@ -790,11 +678,9 @@ void BuddyStore::index_write_thread_entry()
       dout(10) << __func__ << " woke up after " << woke << dendl;
     }
 
-    index_write_lock.Unlock();
+    do_apply_lock.Unlock();
 
-    // list 에 lock 안걸고 가져와서 하려면 swap 쓰면 됨. 
-    // list.swap() 
-
+	//----------- do_checkpoint -----------//
 	if(apply_manager.commit_start()) {
 	  // committing_seq setting 
 	  uint64_t cp = apply_manager.get_committing_seq();
@@ -802,9 +688,21 @@ void BuddyStore::index_write_thread_entry()
 	  apply_manager.commit_started();
 #ifdef FILE_CONTAINER
 	  if(fc) fc->sync();
-#else
-	  index_write_sync();
 #endif
+
+	  // -- last_checkpointed_seq -- 
+	  dout(10) << __func__ << " last_checkpointed_seq " << last_checkpointed_seq << dendl;
+	  string fn = path + "/last_checkpointed_seq";
+	  bufferlist cbl;
+	  ::encode(last_checkpointed_seq, cbl);
+
+	  // need to be direct & sync 
+	  // 나중에 kvmap 으로 통합하기. 
+	  int r = cbl.write_file(fn.c_str());
+	  if (r < 0){
+		dout(10) << "Failed to write last_checkpointed seq " << dendl;
+		assert(0 == "last checkpoint seq write error");
+	  }
 
 	  // kvmap sync
 	  if (kvmap_exist){
@@ -820,92 +718,13 @@ void BuddyStore::index_write_thread_entry()
 
     meta_stat();
 
-    index_write_lock.Lock();
-
-    // 1. collection index flush 
-    // 2. do_checkpoint (사실.. do_checkpoint 가 감싸야 되는디. 
-    // 현재 _save 에서 하는건 
-    // collection 의 object metadata, xattr, data 까지 다 적어서..
-    // indexing flush 에서는 사실 indexing 만 내리면 되니까. 조금 다름.  
-    // 그리고 xattr 랑 omap 은 kv store 이용할거니까 빼고. 
-    // 그때 그때 거기로 보내주고. 
-    // indexing 은? 사실 indexing 도 그렇게 해도 되는군.
-    // 지금 extent tree 인데- 
-    // 일단은.. 그냥 이번 버전에서는 내가 flush 하는걸로 하자. 
+    do_apply_lock.Lock();
   }
 
-  stop_index_write = false;
-  index_write_lock.Unlock();
+  stop_do_apply = false;
+  do_apply_lock.Unlock();
 
 }
-
-int BuddyStore::index_write_sync()
-{
-
-#ifndef FILE_CONTAINER
-  dout(10) << __func__ << dendl;
-
-  bufferlist bl;
-  for (ceph::unordered_map<coll_t,CollectionRef>::iterator p = coll_map.begin();
-       p != coll_map.end();
-       ++p) {
-    p->second->encode_index(bl);
-  }
-  dout(5) << __func__ << " index write size = " << bl.length() << " B " << (bl.length()/ 1048576) << " MB " <<  dendl;
-
-  string fn = path + "/" + "log_data_file.index";
-
-  int flags = O_RDWR | O_CREAT | O_DIRECT | O_DSYNC;
-  int r = ::open(fn.c_str(), flags, 0644);
-
-  if (r < 0){
-    dout(10) << "Failed to create file: " << fn << dendl; 
-    return r;
-  }
-
-  int fd = r;
-
-  uint64_t foff = 0; // 나중에 log 방식으로 바꾸자. 
-
-  uint64_t orig_len = bl.length();
-  uint64_t align_len = round_up (bl.length());
-  uint64_t align_foff = round_down (foff);
-
-  dout(10) << __func__ << " align_len " << align_len << " align_off " << align_foff << dendl;
-
-  bufferlist abl;
-
-  // 원래 여기서 기존 데이터 읽어와야 하는데.. 우선 걍 하자. 
-  abl.append_zero(foff - align_foff);
-  abl.claim_append(bl);
-  abl.append_zero(align_len - orig_len);
-
-  abl.rebuild_aligned(CEPH_DIRECTIO_ALIGNMENT);
-
-  dout(10) << __func__ << " fd " << fd << " abl.length(align) " << abl.length() << 
-    " align_foff " << align_foff << dendl;
-
-  assert(abl.length() % BUDDY_FALLOC_SIZE == 0);
-  assert(align_foff % BUDDY_FALLOC_SIZE == 0);
-
-
-  r = abl.write_fd(fd, align_foff);
-    
-
-  //string fn = path + "/" + stringify(p->first);
-  //int r = bl.write_file(fn.c_str());
-    
-  if (r < 0) {
-    dout(10) << __func__ <<  " Error in write " << cpp_strerror(r) << dendl;
-  }
-
-  return r;
-#else
-  return 0;
-#endif
-
-}
-
 
 // ---------------
 // read operations
@@ -1022,83 +841,37 @@ int BuddyStore::read(
 
   dout(10) << __func__ << " len " << l << dendl;
 
+  bufferlist mbl, fbl;
+
   if (data_hold_in_memory){
     dout(10) << __func__ << " data_hold_in_memory " << dendl; 
-    bufferlist mbl; 
     ret = o->read(offset, l, mbl);
-    bl.claim(mbl);
-    return ret;
   }
-
-
-  // load data when data_hold_in_memory is unset 
-  //if(ret < static_cast<int>(len)) {
-  if(!data_hold_in_memory && debug_file_read && data_flush) {
-#ifdef FILE_CONTAINER
-	bufferlist mbl;
-	ret = fc->read(c->cid, oid, offset, len, mbl);
-	bl.claim(mbl);
-
-	// test needed
-	return ret;
-#else
-    bufferlist fbl;
-
-    vector<buddy_iov_t> iov;
-    int ret = c->data_file_get_index(oid, offset, l, iov);
-    uint64_t tot_bytes = 0;
-    uint64_t tot_reads = 0;
-    
-
-    if (ret < 0){
-      dout(5) << __func__ << " Not found object in data file " << dendl;
-    }
   
-    dout(10) << __func__ << " iov " << iov.size() << dendl;
+// FILE_CONTAINER
+  //if(ret < static_cast<int>(len)) {
+  // 여기 내려오면 data_hold_in_memory 가 아니거나 debug 를 해야하는 상황. 
+  if (!data_hold_in_memory) { // data_flush 
+	assert(data_flush);
+	ret = fc->read(c->cid, oid, offset, len, fbl);
 
-    for(vector<buddy_iov_t>::iterator iovp = iov.begin(); 
-	iovp != iov.end(); iovp++) {
+	if(debug_file_read) {
+	  const char *sptr, *mptr;
+	  bufferlist::iterator sp = fbl.begin();
+	  size_t sr = sp.get_ptr_and_advance(10, &sptr);
 
-      dout(10) << __func__ << " " << (*iovp) << dendl;
-      tot_bytes += (*iovp).bytes;
+	  bufferlist::iterator mp = mbl.begin();
+	  size_t mr = mp.get_ptr_and_advance(10, &mptr);
 
-//----------- here: buffered read ------- //
-#ifdef BUDDY_READ_BUFFER
-      tot_reads += data_file.read(fbl, (*iovp).foff, (*iovp).bytes);
-#else
-      tot_reads += data_file.read_fd(fbl, (*iovp).foff, (*iovp).bytes);
-#endif
-    }
-    assert(tot_bytes == l);
-    assert(tot_bytes == tot_reads);
+	  int cmp = memcmp(sptr,mptr,10);
+	  assert(cmp == 0);
+	}
 
-    dout(10) << __func__ << " read_debug: storage_read_bl " << fbl.length() << dendl;
-
-
-    if(data_hold_in_memory) {
-      assert(fbl.contents_equal(bl));
-
-      bl.claim(fbl);
-      dout(10) << __func__ << "claim fbl " << bl.length() << dendl;
-#if 0
-      // test
-      const char *sptr, *mptr;
-      bufferlist::iterator sp = fbl.begin();
-      size_t sr = sp.get_ptr_and_advance(10, &sptr);
-
-      bufferlist::iterator mp = bl.begin();
-      size_t mr = mp.get_ptr_and_advance(10, &mptr);
-
-      int cmp = memcmp(sptr,mptr,10);
-    
-      dout(10) << " cmp " << cmp << " mptr " << (*mptr) << " sptr " << *sptr << dendl;
-#endif
-    } else {
-      bl.claim(fbl);
-    }
-#endif
+	bl.claim(fbl);
+	return ret;
   }
-
+  
+  bl.claim(mbl);
   return ret;
 }
 
@@ -1697,17 +1470,6 @@ int BuddyStore::queue_transactions(Sequencer *posr,
 	  assert(0);
 	}
   }
-
-#else
-  if (data_flush) {
-    r = generate_iov(o->tls, o->tls_iov);
-    if (r < 0) {
-      dout(10) << "Failed to generate iov" << dendl;
-    }
-    utime_t lat = ceph_clock_now();
-    lat -= start;
-    dout(10) << __func__ << " generate_iov lat = " << lat << dendl; 
-  }
 #endif
 
 
@@ -1750,10 +1512,6 @@ int BuddyStore::queue_transactions(Sequencer *posr,
 	  fc->submit_entry(ret, o->tls_iov, new C_FCWriteCompletion(this, osr, o), osd_op);
 	  fc->submit_manager.submit_finish(ret);
 	}
-#else
-    if (data_flush && o->tls_iov.size() > 0){
-      queue_data_op(osr, o);
-    }
 #endif
 
     submit_manager.op_submit_finish(op_num);
@@ -1862,150 +1620,6 @@ void BuddyStore::_finish_journal (OpSequencer *osr, Op *o, Context *ondisk)
   dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
 }
 
-
-#ifdef EUNJI
-/***************
- * generate_iov_data_bl
- * iov 랑 bl 받아서 쪼개는 것임. 
- * 그런데 buddy_iov_t 의 ooff 가 원래는 주어진 bl 에서의 offset 을 말하는데 
- * 나중에 0으로 세팅 안해야 원래 write 되었을때 어디까지 쓰여졌는지..
- * tracking 할 수 있음. 
- * 예를 들어, 0 - 9 까지의 10개의 데이터가 0 - 2, 3 - 9 까지 
- * 따로따로 맵핑되어 쓰여졌다면 buddy_iov_t 의 ooff 가 첫번째는 0, 두번째는 3으로 써야할듯. 
- **************/
-/********************
- * generate_iov()
- *  This function generate iovec and log bufferlist. 
- *  trim_map 을 Transaction 이 생성해주면 parsing 하는 단계 없을수도 있음. 
- *  그런데 parse_transaction 에서 context 만들어서- 
- *  나중에 처리할 수 있도록 하면 좋겠음. 
- *******************/
-int BuddyStore::generate_iov(vector<Transaction>& tls, vector<buddy_iov_t>& tls_iov)
-{
-
-  dout(10) << __func__  << " transactions = " << tls.size() << dendl;
-
-  for (vector<Transaction>::iterator p = tls.begin(); p != tls.end(); ++p) {
-
-    Transaction tr = *p; 
-    Transaction::iterator i = tr.begin();
-
-    for(vector<Transaction::Op>::iterator op_p = tr.punch_hole_ops.begin();
-	  op_p != tr.punch_hole_ops.end(); ++op_p) {
-
-      vector<buddy_iov_t> op_iov; 
-
-      uint64_t ooff = op_p->off;
-      uint64_t bytes = op_p->len;
-      coll_t cid = i.get_cid(op_p->cid);
-      ghobject_t oid = i.get_oid(op_p->oid);
-
-	  // op_iov is set 
-	  // iov 는 vector 형태로 유지. object 가 여러개의 iov 로 쪼개질 수 있으니까. 
-      //int ret = _alloc_space(cid, oid, ooff, bytes, op_iov);
-      int ret = data_file.alloc_space(cid, oid, ooff, bytes, op_iov);
-
-      if (ret < 0){
-		dout(10) << "Failed to alloc_space" << dendl;
-		return -ENOENT;
-      }
-
-	  // prepare buffer 
-      uint32_t punch_hole_off = op_p->punch_hole_off;
-      uint32_t header_len = sizeof(__u32);
-	  uint32_t data_start_off = punch_hole_off + header_len;
-
-	  for(vector<buddy_iov_t>::iterator ip = op_iov.begin();
-		  ip != op_iov.end(); ++ip){
-
-		bufferlist newdata;
-
-		newdata.append_zero((*ip).foff - (*ip).get_alloc_soff());
-		
-		// copy data from transactions' bl 
-		newdata.substr_of(
-		  tr.data_bl, 
-		  data_start_off + (*ip).src_off, 
-		  (*ip).bytes);
-		
-		newdata.append_zero((*ip).get_alloc_bytes() - newdata.length());
-
-		(*ip).data_bl.claim(newdata);
-
-		assert((*ip).get_alloc_bytes() == (*ip).data_bl.length());
-		dout(10) << op_iov << dendl;
-
-	  }
-	  // tls_iov 는 실제 write_thread 가 file 에 io 할 때 쓰는 정보임. 
-	  tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
-
-	  vector<Transaction::iov_t> tmp_iov;
-
-	  for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
-		  iovp != op_iov.end(); ++iovp) {
-
-		tmp_iov.push_back(Transaction::iov_t(data_file.fname, (*iovp).foff, (*iovp).bytes));
-		//tmp_iov.push_back(Transaction::iov_t((*iovp).fname, (*iovp).foff, (*iovp).bytes));
-	  }
-	  tr.punch_hole_map.insert(make_pair(punch_hole_off, tmp_iov)); 
-
-	} // end of punch_hole_ops loop  
-  } // end of tls loop
-
-  dout(10) << __func__  << " iov = " << tls_iov.size() << dendl;
-  return 0;
-}
-#endif
-#if 0
-void BuddyStore::generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, uint32_t start_off)
-{
-  dout(10) << __func__ << " iov count = " << iov.size() << dendl; 
-
-#if 0
-  // test
-  bufferlist::iterator bp = bl.begin();
-  const char *ptr;
-  bp.get_ptr_and_advance(10, &ptr);
-  int i;
-  for(i=0; i<10; i++) 
-    dout(10) << __func__ << *(ptr+i) << dendl;
-#endif
- 
- // iov 에서 ooff 는  
-  for(vector<buddy_iov_t>::iterator ip = iov.begin();
-      ip != iov.end(); ++ip){
-
-    dout(10) << __func__ << " start_off " << start_off << " ooff " << (*ip).off_in_src << " len " << (*ip).bytes << " bl.length() " << bl.length() << dendl;
-   
-    bufferlist newdata;
-  
-    // copy data from bl 
-    newdata.append_zero((*ip).off_in_blk);
-    newdata.substr_of(bl, start_off + (*ip).off_in_src, (*ip).bytes);
-    dout(10) << " newdata length " << newdata.length() << dendl;
-    //newdata.append_zero((*ip).alloc_bytes - newdata.length());
-    newdata.append_zero((*ip).get_alloc_bytes - newdata.length());
-    //(*ip).ooff = 0; // after bl split. 이건 원래 값 유지시킬 것.  
-    dout(10) << " newdata length post_pad " << newdata.length() << dendl;
-
-    // prepad 는 write_fd 에서 align 안맞는 경우 앞뒤로 넣어줌. 
-
-    (*ip).data_bl.claim(newdata);
-    assert((*ip).alloc_bytes == (*ip).data_bl.length());
-    dout(10) << iov << dendl;
-
-#if 0
-  // test
-  bufferlist::iterator dp = (*ip).data_bl.begin();
-  const char *dptr;
-  dp.get_ptr_and_advance(10, &dptr);
-  for(i=0; i<10; i++) 
-    dout(10) << __func__ << " after " << *(dptr+i) << dendl;
-#endif
-
-  }
-}
-#endif
 
 
 void BuddyStore::_do_transaction(Transaction& t, uint64_t op_seq, 
@@ -2464,6 +2078,11 @@ int BuddyStore::_truncate(const coll_t& cid, const ghobject_t& oid, uint64_t siz
   const uint64_t old_size = o->get_size();
   int r = o->truncate(size);
   used_bytes += (o->get_size() - old_size);
+
+#ifdef FILE_CONTAINER
+  fc->truncate(cid, oid, size);
+#endif
+
   return r;
 }
 
@@ -2487,21 +2106,6 @@ int BuddyStore::_remove(const coll_t& cid, const ghobject_t& oid, const Sequence
 
 #ifdef FILE_CONTAINER
 	fc->remove(cid, oid); 
-#else
-    // release space 
-    auto p = c->data_file_index_map.find(oid); 
-    if (p == c->data_file_index_map.end()) {
-      dout(10) << __func__ << " oid " << oid << " has no file space" << dendl;
-      return 0;
-    }
-
-    int r = data_file.release_space(p->second);
-  
-    if(r != 0) {
-      dout(10) << __func__ << " Failed to release space " << dendl;
-      return 0;
-    }
-    c->data_file_index_map.erase(oid);
 #endif
     
     // remove set attr, omap key
@@ -2670,6 +2274,14 @@ int BuddyStore::_clone(const coll_t& cid, const ghobject_t& oldoid,
   no->omap_header = oo->omap_header;
   no->omap = oo->omap;
   no->xattr = oo->xattr;
+
+
+#ifdef FILE_CONTAINER
+  // 같은 collection 내에서만 clone 허용.
+  uint64_t osize = fc->get_size(cid, oldoid);
+  fc->clone(cid, oldoid, newoid, 0, osize, 0);
+#endif
+
   return 0;
 }
 
@@ -2697,6 +2309,10 @@ int BuddyStore::_clone_range(const coll_t& cid, const ghobject_t& oldoid,
   const uint64_t old_size = no->get_size();
   no->clone(oo.get(), srcoff, len, dstoff);
   used_bytes += (no->get_size() - old_size);
+
+#ifdef FILE_CONTAINER
+  fc->clone(cid, oldoid, newoid, srcoff, len, dstoff);
+#endif
 
   return len;
 }
@@ -3526,11 +3142,6 @@ void BuddyStore::Collection::encode(bufferlist& bl) const {
   dout(5) << __func__ << " object encode_base " << object_encode_base_size << dendl;
   size = bl.length();
 
-#ifndef FILE_CONTAINER
-  // Eunji: here.. it's doing ..
-  ::encode(data_file_index_map, bl);
-#endif
-
   dout(5) << __func__ << " index encode " << bl.length() - size << dendl;
   size = bl.length();
   ENCODE_FINISH(bl);
@@ -3550,9 +3161,6 @@ void BuddyStore::Collection::decode(bufferlist::iterator& p) {
 	object_map.insert(make_pair(k, o));
 	object_hash.insert(make_pair(k, o));
   }
-#ifndef FILE_CONTAINER
-  ::decode(data_file_index_map, p);
-#endif
   DECODE_FINISH(p);
 }
 
@@ -3565,241 +3173,6 @@ BuddyStore::ObjectRef BuddyStore::Collection::create_object() const {
   return new BufferlistObject(cct, cct->_conf->buddystore_data_hold_in_memory);
 }
 
-
-#ifndef FILE_CONTAINER
-
-// EUNJI 
-/****************************************/
-/* insert index                      	*/
-/* This function should be called after */
-/* logging completed 	      	     	*/
-/****************************************/
-
-int BuddyStore::Collection::data_file_insert_index(const ghobject_t& oid, const uint64_t ooff, 
-  const uint64_t foff, const uint64_t bytes)
-{
-
-  dout(10) << __func__ << " oid " << oid << " ooff " << ooff <<
-    " foff " << foff << " bytes " << bytes << dendl;
-
-  RWLock::WLocker l(c_lock);
-
-  buddy_index_map_t* omap;
-  buddy_index_t* nidx = new buddy_index_t(ooff, foff, bytes); 
-
-  uint64_t ns = 0, ne = 0, os = 0, oe = 0;
-  map<uint64_t, buddy_index_t>::iterator sp, p;
-
-  list<uint64_t> delete_list;
-  list<buddy_index_t> frag_list;  
-
-  // find map 
-  map<ghobject_t, buddy_index_map_t>::iterator omap_p = data_file_index_map.find(oid);
-
-  // not found? create and insert entry. done! 
-  if(omap_p == data_file_index_map.end()){
-    dout(10) << __func__ <<  " oid is not found. create index map " << dendl;
-
-    // create index_map 
-    omap = new buddy_index_map_t();
-    data_file_index_map.insert(make_pair(oid, (*omap)));
-    omap_p = data_file_index_map.find(oid);
-  }
-
-  // found map 
-  omap = &omap_p->second;
-
-  // debug
-  int count = 1;
-  for (map<uint64_t, buddy_index_t>::iterator idx_p = omap->index_map.begin();
-    idx_p != omap->index_map.end();
-    idx_p++){
-    dout(10) << __func__ << " oid " << oid << " " << count << ":" << " index: " << idx_p->second << dendl; 
-  }
-
-  sp = omap->index_map.upper_bound(ooff);
-  dout(10) << __func__ << " ooff " << ooff << " upper_bound " << sp->second << dendl;
-
-  if(sp == omap->index_map.begin())
-    dout(10) << __func__ << " sp = begin " << dendl;
-  else if(sp == omap->index_map.end())
-    dout(10) << __func__ << " sp = end " << dendl; 
-
- 
-  if (sp == omap->index_map.begin() && sp == omap->index_map.end()){
-    dout(10) << __func__ << " empty index map " << dendl;
-    goto insert_new_index;
-  }
-
-  // overlapped range deletion 
-  ns = ooff;
-  ne = ooff + bytes -1;
-
-
-  if(sp!= omap->index_map.begin()) p = --sp;
-  else p = sp;
-
-  /// punch out 
-  while(p != omap->index_map.end()){
-    
-    dout(10) << __func__ << " p iov " << p->second << dendl;
-
-    os = p->second.ooff;
-    oe = p->second.ooff + p->second.bytes - 1;
-    //oe = p->second.ooff + p->second.used_bytes - 1;
-    dout(10) << __func__ << " os " << os << " oe " << oe << dendl;
-    dout(10) << __func__ << " ns " << ns << " ne " << ne << dendl;
-
-    if (os > ne)
-      break;
-
-    if (oe < ns){
-      p++;
-      continue;
-    }
-
-    buddy_index_t prev_idx = p->second;
-    buddy_index_t post_idx = p->second;
-    dout(10) << __func__ << " prev_idx " << prev_idx << " post_idx " << post_idx << dendl;
-
-    // erase 전에 증가시켜야 함. 
-    //omap->index_map.erase(os);
-    delete_list.push_back(os);
-
-
-    if(ns == os && ne == oe) {
-      dout(10) << __func__ << " full match " << dendl;
-      // 여기서 break 하면 안되고 정보를 업데이트해줘야 함. 
-      // 아.. 삭제했으니까 break 하고 아래에서 다시 넣으면 되는구나. 
-      break;
-    }
-
-    if(ns > os && ns < oe){
-      dout(10) << __func__ << " partial right match " << dendl;
-      prev_idx.bytes -= (oe -ns + 1);
-      dout(10) << __func__ << " prev_idx " << dendl;
-      frag_list.push_back(prev_idx);
-//      omap->index_map.insert(make_pair(prev_idx.ooff, prev_idx));
-    }
-
-    if(ne > os && ne < oe) {
-      dout(10) << __func__ << " partial left match " << dendl;
-      post_idx.ooff -= (ne - os + 1);
-      post_idx.foff -= (ne - os + 1);
-      post_idx.bytes -= (ne - os + 1); 
-      frag_list.push_back(post_idx);
-      dout(10) << __func__ << " post_idx " << dendl;
-      //omap->index_map.insert(make_pair(post_idx.ooff, post_idx));
-    }
-
-    dout(10) << __func__ << " increment p " << dendl;
-    p++;
-
-  }
-//delete_index:
-  dout(10) << __func__ << " delete_list " << delete_list.size() << dendl;
-
-  for(list<uint64_t>::iterator p = delete_list.begin(); p != delete_list.end() ; p++){
-    dout(10) << __func__ << " delete : " << *p << dendl;
-    omap->index_map.erase(*p);
-  }
-
-//insert_partial_index:
-  dout(10) << __func__ << " partial_list " << frag_list.size() << dendl;
-
-  for(list<buddy_index_t>::iterator p = frag_list.begin();
-      p != frag_list.end(); p++){
-  
-      dout(10) << __func__ << " frag : " << *p << dendl;
-      omap->index_map.insert(make_pair((*p).ooff, (*p)));
-  }
-
-insert_new_index:
-  // insert 
-  omap->index_map.insert(make_pair(ooff, (*nidx)));
-
-// for debugging... 
-  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
-      tmp != omap->index_map.end() ; tmp++){
-    dout(10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
-  }
-  return 0;
-}
-
-
-int BuddyStore::Collection::data_file_get_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, 
-    vector<buddy_iov_t>& iov)
-{
-
-
-  dout(10) << __func__ << " cid " << cid << " oid " << oid << " ooff " << ooff << " bytes " << bytes << dendl;
-
-  RWLock::RLocker l(c_lock);
-
-  // find map 
-  map<ghobject_t, buddy_index_map_t>::iterator omap_p = data_file_index_map.find(oid);
-
-  if(omap_p == data_file_index_map.end()){
-    return -1;
-  }
-
-  // found map 
-  buddy_index_map_t* omap = &omap_p->second;
-  map<uint64_t, buddy_index_t>::iterator p;
-
-  // for debugging... 
-  for(map<uint64_t, buddy_index_t>::iterator tmp = omap->index_map.begin(); 
-      tmp != omap->index_map.end() ; tmp++){
-    ldout(cct, 10) << __func__ << " oid " << oid << " index_map = " << (*tmp) << dendl;
-  }
-
-  uint64_t rbytes = bytes;
-  uint64_t soff = ooff;
-  uint64_t eoff = ooff + bytes;
-  uint64_t foff = 0;
-  uint64_t fbytes = 0;
-  uint64_t falloc_bytes = 0;
-  uint64_t peoff = 0;
-
-  // search start first smaller offset that the target 
-  p = omap->index_map.upper_bound(soff);
-  if (p == omap->index_map.begin()){
-    ldout(cct, 10) << __func__ << " not found index starting with ooff " << ooff << dendl;
-    return -1;
-  }
-  p--;
-
-  while(rbytes > 0) {
-
-    ldout(cct, 10) << __func__ << " rbytes = " << rbytes << " p.ooff " << p->second.ooff << " p.eoff " << p->second.ooff + p->second.bytes << dendl;
-
-    assert(soff >= p->second.ooff && soff <= (p->second.ooff + p->second.bytes));
-
-    peoff = p->second.ooff + p->second.bytes;
-
-    foff = p->second.foff + (soff - p->second.ooff);
-    fbytes = (peoff < eoff? peoff : eoff) - soff;
-//    falloc_bytes = p->second.alloc_bytes; // 이건 맞는지 디버깅때 확인해야함.
-
-//  buddy_iov_t(const coll_t _cid, const ghobject_t& _oid, string _fn, uint64_t _src_off, uint64_t _ooff, uint64_t _foff, uint64_t _bytes) 
-
-
-    buddy_iov_t* niov = new buddy_iov_t(cid, oid, ooff, foff, fbytes, 0, soff); //falloc_bytes); 
-    //buddy_iov_t* niov = new buddy_iov_t(cid, oid, "/mnt/buddystore/data_file.0", soff, ooff, foff, fbytes); //falloc_bytes); 
-    iov.push_back(*niov);
-
-    rbytes -= fbytes;
-    soff += fbytes;
-
-    p++;
-  }
-
-  assert(rbytes == 0);
-
-
-  return 0;
-}
-#endif
 
 ////--------------------
 
@@ -3854,382 +3227,7 @@ void BuddyStore::queue_op(OpSequencer *osr, Op *o)
   op_wq.queue(osr);
 }
 
-void BuddyStore::queue_data_op(OpSequencer *osr, Op *o)
-{
-  // queue op on sequencer, then queue sequencer for the threadpool,
-  // so that regardless of which order the threads pick up the
-  // sequencer, the op order will be preserved.
-  ldout(cct, 10) << __func__ << " seq " << o->op << dendl;
-//  osr->qlock.Lock();
-    
-  dataq_lock.Lock();
 
-  osr->queue_data(o);
-  dataq.push_back(osr);
-  dataq_cond.Signal();
-
-  dataq_lock.Unlock();
-
-//#endif
-//
-#if 0
-
-  if(!osr->being_served){
-    ldout(cct, 10) << __func__ << " osr " << *osr << " is newly queued " << dendl; 
-    data_op_wq.queue(osr);
-    osr->being_served = true;
-  } else {
-    ldout(cct, 10) << __func__ << " osr " << *osr << " is already queued " << dendl; 
-  }
-#endif
- // osr->qlock.Unlock();
-
-//#ifdef DATA_WRITE_FLUSH
-//#endif
-}
-
-
-#if 0
-void buddystore::queue_io_op(opsequencer *osr, op *o)
-{
-  dout(5) << "queue_io_op " << o << " seq " << o->op
-	  << " " << *osr
-	  << " " << o->bytes << " bytes"
-	  << "   (queue has " << throttle_ops.get_current() << " ops and " << throttle_bytes.get_current() << " bytes)"
-	  << dendl;
-  op_wq.queue(osr);
-}
-#endif
-
-////////////////////////////
-// data_write_entry()
-////////////////////////////
-void BuddyStore::data_write_thread_entry()
-{
-
-  dout(10) << "data_write_thread_entry start" << dendl;
-  utime_t lat;
-  utime_t start;
-
-  dataq_lock.Lock(); // ----- lock here!
-
-  while (!stop_data_write) {
-    if (dataq.empty()) {
-
-      dout(20) << "data_write_thread_entry going to sleep" << dendl;
-      dataq_cond.Wait(dataq_lock);
-      dout(20) << "data_write_thread_entry woke up" << dendl;
-	continue;
-    }
-
-//-------------------------------
-    while(!dataq.empty()){
-      dout(10) << __func__ << " dataq is not empty size = " << dataq.size() << dendl;
-
-      list<OpSequencer*> items;
-      list<pair<OpSequencer*, Op*>> complete_items;
-
-      // new buddy_iov_t list 
-      set<buddy_iov_t> aggr_iovec;
-
-      dataq.swap(items);
-      //batch_pop_dataq(items);
-
-      dataq_lock.Unlock(); // ---- unlock here!  
-
-//--------------------------------
-
-      dout(10) << __func__<< " go through items num " << items.size() << dendl;
-
-	  for (list<OpSequencer*>::iterator it = items.begin();
-		  it != items.end();
-		  it++)
-	  {
-		OpSequencer* osr = *it;
-		assert(osr != NULL);
-		Op* o = osr->pop_queue_data();
-		assert(o != NULL);
-
-		dout(10) << __func__ << " pop: seq " << o->op << dendl;
-		assert(o->tls_iov.size() > 0);
-
-		for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
-			iovp != o->tls_iov.end(); iovp++) {
-
-		  buddy_iov_t iov = *iovp;
-
-		  // --- 
-		  // check a possibility of aggregation
-		  // -- 
-		  set<buddy_iov_t>::iterator r = aggr_iovec.lower_bound(iov);
-
-		  // 1. check prev_node
-		  if(r != aggr_iovec.begin()){
-			--r;
-			buddy_iov_t r_iov = (*r);
-
-			//if((r->foff + r->alloc_bytes) == iov.foff){
-			if((r_iov.get_alloc_eoff()) == iov.get_alloc_soff()){
-
-			  dout(10) << __func__ << " merged to prev node " << dendl;
-
-			  // new data 
-			  bufferlist newdata;
-			  newdata.claim(iov.data_bl);
-
-			  // creates a new vector 
-			  buddy_iov_t niov (*r);
-			  niov.data_bl.append(newdata);
-
-			  //niov.foff = iov.foff; 
-			  //niov.alloc_bytes += iov.alloc_bytes;
-			  //assert(niov.alloc_bytes == niov.data_bl.length());
-
-			  dout(10) << __func__ << niov << dendl;
-
-			  // erase and add 
-			  aggr_iovec.erase(r);
-			  aggr_iovec.insert(niov);
-
-			  //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
-
-			  //r->data_bl.claim_prepend(iov.data_bl);
-			  //r->foff = so;
-			  //r->alloc_bytes += iov.alloc_bytes;
-			  continue;
-			}
-		  }
-
-	  // 2. check next node 
-	  if(r != aggr_iovec.end()){
-
-		buddy_iov_t r_iov = (*r);
-
-	    //if(r->foff == (iov.foff + iov.alloc_bytes)){	
-		if(iov.get_alloc_eoff() == r_iov.get_alloc_soff()) {
-	      dout(10) << __func__ << " merged to next node " << dendl;
-
-	      // new data 
-	      bufferlist newdata;
-	      newdata.claim(iov.data_bl);
-
-	      // creates a new vector 
-	      buddy_iov_t niov (*r);
-	      niov.data_bl.claim_prepend(newdata);
-
-	      niov.foff = iov.foff;
-	     // niov.alloc_bytes += iov.alloc_bytes;
-
-		  //assert(niov.alloc_bytes == niov.data_bl.length());
-
-		  dout(10) << __func__ << niov << dendl;
-
-		  // erase and add 
-		  aggr_iovec.erase(r);
-		  aggr_iovec.insert(niov);
-
-		  //iov.data_bl.splice(0, iov.data_bl.length(), &r->data_bl);
-
-		  //r->data_bl.claim_prepend(iov.data_bl);
-		  //r->foff = so;
-		  //r->alloc_bytes += iov.alloc_bytes;
-		  continue;
-		}
-	  }
-
-	  // no aggregation 
-	  dout(10) << __func__ << " no aggregation " << dendl;
-	  aggr_iovec.insert(iov);
-
-		} // end of iov for loop 
-
-		complete_items.push_back(make_pair(osr, o));
-	  } // total_bl for items 
-
-
-	  while(!items.empty()){
-		items.pop_front();
-	  }
-
-	  //--------------------------------
-	  // 2. write buffers
-	  dout(10) << __func__ << " aggr_iovec size " << aggr_iovec.size() << dendl;
-
-	  for(set<buddy_iov_t>::iterator iovp = aggr_iovec.begin();
-		  iovp != aggr_iovec.end();
-		  iovp++)
-      {
-	  dout(10) << __func__ << " aggr_iovec: foff " << iovp->foff << " len " << iovp->data_bl.length() << dendl;
-  
-	  buddy_iov_t iov = *iovp;
-
-	  assert(iov.get_alloc_bytes() == iov.data_bl.length());
-
-	  //---
-	  start = ceph_clock_now(); 
-	  int ret = 0;
-	  if(file_inplace_write)
-	    ret = data_file.write_fd(iov.data_bl, 0);
-	  else
-	    ret = data_file.write_fd(iov.data_bl, round_down(iov.foff));
-
-	  assert(ret >= 0);
-//------------------------ here: data_file.write() ---------------//
-
-
-
-	    //ret = data_file.write_fd(iov.data_bl, iov.foff);
-#if 0
-	  dout(10) << " buffertest " << dendl;
-
-	  bufferptr a("one", 3);
-	  bufferptr b("two", 3);
-	  bufferptr c("three", 5);
-	  bufferlist testbl;
-	  testbl.append(a);
-	  dout(10) << " one: testbl length " << testbl.length() << dendl;
-	  testbl.append(b);
-	  dout(10) << " two: testbl length " << testbl.length() << dendl;
-	  testbl.append(c);
-	  dout(10) << " three: testbl length " << testbl.length() << dendl;
-
-	  const char *ptr;
-	  bufferlist::iterator testp = testbl.begin();
-	  size_t testr = testp.get_ptr_and_advance(3, &ptr);
-	  int cmp = memcmp(ptr, "one", 3);
-	  dout(10) << " cmp " << cmp << " ptr " << (*ptr) << " testr " << testr << dendl;
-#endif
-
-#if 0
-	  // verification 
-	  bufferlist read_bl;
-	  ret = data_file.read_fd(read_bl, round_down(iov.foff), iov.data_bl.length());
-
-	  if(read_bl.contents_equal(iov.data_bl))
-	    dout(10) << __func__ << "write_verify: equal " << dendl;
-	  else
-	    dout(10) << __func__ << "write_verify: not equal " << dendl;
-	  //assert(ret == 0);
-#endif
-
-	  lat = ceph_clock_now();
-	  lat -= start;
-	  dout(5) << __func__ << " write_fd lat " << lat << dendl;
-      }
-
-//--------------------------------
-// 3. finish 
-	  for (list<pair<OpSequencer*, Op*>>::iterator it = complete_items.begin();
-		  it != complete_items.end();
-		  it++)
-	  {
-		OpSequencer* osr = it->first;
-		Op* o = it->second;
-
-		int r = osr->dec_jcount(o->op);
-
-		dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " completed " << "dec_jcount = " << r << dendl;
-
-
-		if (r == 0) {
-
-		  op_wq_lock.Lock();
-		  queue_op(osr, o);
-		  op_wq_lock.Unlock();
-
-		  // called with tp lock held
-		  data_op_queue_release_throttle(o);
-
-		  // do ondisk completions async, to prevent any onreadable_sync completions
-		  // getting blocked behind an ondisk completion.
-		  if (o->ondisk) {
-			Mutex::Locker locker(ondisk_finisher_lock);
-			dout(20) << __func__ << " on finisher_queue" << dendl;
-			ondisk_finisher.queue(o->ondisk);
-			//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
-		  }
-
-		  list<Context*> to_queue;
-		  osr->dequeue_wait_ondisk(&to_queue);
-
-		  if (!to_queue.empty()) {
-			Mutex::Locker locker(ondisk_finisher_lock);
-			dout(20) << "to_queue is not empty" << dendl;
-			ondisk_finisher.queue(to_queue);
-			//ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
-		  }
-
-		  lat = ceph_clock_now();
-		  lat -= o->start;
-
-		  if (logger) {
-			logger->tinc(l_buddystore_journal_all_latency, lat);
-		  }
-		  dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
-
-		} // end of if (r == 0) 
-
-	  }// end of for completion items 
-
-	  while(!complete_items.empty())
-		complete_items.pop_front();
-
-	  dout(10) << __func__ << " finish " << dendl;
-
-	  dataq_lock.Lock();
-
-		} // end of while dataq_empty 
-
-		dout(10) << __func__ << " dataq is empty " << dendl;
-
-	  } // end of while 1
-
-	  stop_data_write = false; 
-	  dataq_lock.Unlock();
-  dout(10) << __func__ << " terminate " << dendl;
-}
-
-#if 0
-void BuddyStore::_finish_data_write(OpSequencer *osr)
-{
-
-  // 문제는 여기선 op 를 알수가 없음. 
-  // do_io_op 에서 마무리까지 해야하는듯. 
-  // 이게 finish_io_op 는 순차적으로 호출이 되는듯. 
-  // work queue 에서 그렇게 해줌. 
-  // 그래서 jcount 조절하는거는 - 먼저 하고- 
-  // 실제 q에서 뺴는건 여기서 하면 될듯. 
-
-  // io 끝났으니까 체크하고- 
-  // 만약.. 
-
-  dout(5) << __func__ << o << " seq " << o->op << " " << *osr << " " << o->tls << dendl;
-
-  int r = osr->dec_jcount(osr->op->op, 
-   
-   
-    > 0){
-    dout(5) << "stil in journaling .. jcount = " << dendl;
-    return;
-  }
-  // this should queue in order because the journal does it's completions in order.
-  queue_mem_op(osr, o);
-
-  list<Context*> to_queue;
-  osr->dequeue_journal(o->op, &to_queue);
-
-  // do ondisk completions async, to prevent any onreadable_sync completions
-  // getting blocked behind an ondisk completion.
-  if (ondisk) {
-    dout(10) << " queueing ondisk " << ondisk << dendl;
-    ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
-  }
-  if (!to_queue.empty()) {
-    ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
-  }
-}
-
-#endif
 int BuddyStore::_do_transactions(
   vector<Transaction> &tls,
   uint64_t op_seq,
@@ -4288,17 +3286,6 @@ void BuddyStore::_do_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
 #ifdef FILE_CONTAINER
   r = fc->oxt_map_update(o->tls_iov); 
   assert(r == 0);
-#else
-  for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
-      iovp != o->tls_iov.end(); iovp++) {
-      buddy_iov_t iov = *iovp; 
-      dout(10) << __func__ << " insert_index iov " << iov << " cid " << iov.cid << dendl;
-      CollectionRef c = get_collection(iov.cid);
-      assert(c != NULL); 
-
-      int r = c->data_file_insert_index(iov.oid, iov.ooff, iov.foff, iov.bytes);
-      assert(r==0);
-  } 
 #endif
 
   o->tls.clear();
@@ -4354,164 +3341,6 @@ void BuddyStore::_finish_op(OpSequencer *osr)
   //dump_logger();
 }
 
-
-void BuddyStore::_do_data_op(OpSequencer *osr, ThreadPool::TPHandle &handle)
-{
-
-  dout(10) << __func__ << " osr " << *osr << dendl;
-#if 0
-  utime_t lat;
-
-  list<Op*> ops;
-
-  while(1) {
-    assert(ops.empty()); 
-
-    // 1. get op in dq 
-    osr->qlock.Lock();
-
-    if ((osr->get_data_num()) == 0) {
-      osr->being_served = false;
-      osr->qlock.Unlock();
-      break;
-    }
-    osr->being_served = true;
-    osr->batch_pop_queue_data(ops); 
-    //Op* op = osr->pop_queue_data(); 
-    // ops.push_back(op);
-
-    osr->qlock.Unlock();
-
-    dout(10) << __func__ << " ops = " << ops.size() << dendl;
-
-
-    for(list<Op*>::iterator opp = ops.begin();
-      opp != ops.end(); opp++){
-    
-      Op* o = *opp;
-      BuddyLogDataFileObject* data_file;
-
-
-      lat = ceph_clock_now();
-      lat -= o->start;
-	
-      dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " arrival_lat " << lat << dendl; 
-      // write 
-      for(vector<buddy_iov_t>::iterator iovp = o->tls_iov.begin();
-	iovp != o->tls_iov.end(); iovp++) {
-    
-	buddy_iov_t& iov = *iovp;
-    
-	dout(10) << "iov = " << iov << dendl;
-	assert(iov.bytes == iov.data_bl.length());
-
-
-	// allocation 
-	{
-	  RWLock::RLocker l(coll_file_lock);
-
-	  ceph::unordered_map<coll_t, BuddyLogDataFileObject*>::iterator p = coll_file_map.find(*(iov.cid));
-	  if(p != coll_file_map.end()){
-	    data_file = p->second;
-	  } else {
-	    dout(5) << __func__ << " Failed to find collection data file cid " << *(iov.cid) << dendl;
-	    continue;
-	  }
-	}
-	
-	lat = ceph_clock_now();
-	lat -= o->start;
-	dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " cid " << data_file.cid << " coll_map_lat " << lat << dendl; 
-
-	// foff 가 실제 offset 
-	assert(iov.foff % BUDDY_FALLOC_SIZE == 0);
-
-
-	if(o->op & 1UL){
-	  iov.data_bl.append(4);
-	  data_file.write_fd(iov.data_bl, 0);
-	}
-#if 0
-	if (file_inplace_write)
-	  data_file.write_fd(iov.data_bl, 0);
-	else
-	  data_file.write_fd(iov.data_bl, iov.foff);
-#endif
-
-	lat = ceph_clock_now();
-	lat -= o->start;
-	dout(10) << __func__ << " seq " << o->op << " osr " << *osr << " cid " << data_file.cid << " write_lat " << lat << dendl;
-
-	if(logger){
-	  logger->inc(l_buddystore_data_wr_bytes, iov.data_bl.length());
-	}
-
-	if (!data_directio && data_sync)
-	  data_file.sync();
-
-	iovp->data_bl.clear();
-
-      } // end of iovp for loop. single op is completed 
-
-      o->tls_iov.clear();
-      data_op_queue_release_throttle(o);
-
-      //dout(10) << __func__ << " seq " << o->op << " original write lat " << lat << dendl; 
-    
-      // finish_op : decrease write count 
-      int r = osr->dec_jcount(o->op);
-
-      if (r == 0) {
-	queue_op(osr, o);
-   
-	// called with tp lock held
-	data_op_queue_release_throttle(o);
-
-	// do ondisk completions async, to prevent any onreadable_sync completions
-	// getting blocked behind an ondisk completion.
-	if (o->ondisk) {
-	  Mutex::Locker locker(ondisk_finisher_lock);
-	  dout(20) << __func__ << " on finisher_queue" << dendl;
-	  ondisk_finisher.queue(o->ondisk);
-	  //ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(ondisk);
-	}
-
-	list<Context*> to_queue;
-	osr->dequeue_wait_ondisk(&to_queue);
-
-	if (!to_queue.empty()) {
-	  Mutex::Locker locker(ondisk_finisher_lock);
-	  dout(20) << "to_queue is not empty" << dendl;
-	  ondisk_finisher.queue(to_queue);
-	  //ondisk_finishers[osr->id % m_ondisk_finisher_num]->queue(to_queue);
-	}
-
-	lat = ceph_clock_now();
-	lat -= o->start;
-
-	if (logger) {
-	  logger->tinc(l_buddystore_journal_all_latency, lat);
-	}
-	dout(5) << __func__ << " seq " << o->op << " journal_all complete lat " << lat << dendl; 
-      } // end of if (r == 0) 
-    } // for loop ops 
-
-    // remove all ops  
-    while(!ops.empty()){
-      ops.pop_front();
-    }
-  } // end of while loop ops .. 
-#endif
-
-  dout(10) << __func__ << " osr data queue completed " << dendl;
-}
-
-void BuddyStore::_finish_data_op(OpSequencer *osr)
-{
-#if 0
-  
-#endif
-}
 
 
 ////----------------------------

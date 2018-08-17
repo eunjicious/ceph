@@ -309,7 +309,9 @@ int FileContainer::_alloc_space(coll_t cid, const ghobject_t& oid, const off_t o
 {
   dout(3) << __func__ << " cid " << cid << " oid " << oid << " ooff " << ooff << dendl;
 
+#if 0
   bool need_punch_hole = false;
+#endif
 
   {
 	Mutex::Locker l(fc_lock);
@@ -421,17 +423,7 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 	  // tls_iov 는 실제 write_thread 가 file 에 io 할 때 쓰는 정보임. 
 	  tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
 
-
-	  // transaction 에서 저장하는 건 좀 더 simple 한 형태로 저장. 
-	  // 이 정보가 journal 에 적히게 됨. 
-	  // 이 정보를 저장해줘야 함. 
-	  vector<ObjectStore::Transaction::iov_t> tmp_iov;
-	  for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
-		  iovp != op_iov.end(); ++iovp) {
-		string fname = prefix_fn + to_string((*iovp).file_seq);
-		tmp_iov.push_back(ObjectStore::Transaction::iov_t(fname, (*iovp).foff, (*iovp).bytes));
-	  }
-	  tr.punch_hole_map.insert(make_pair(punch_hole_off, tmp_iov)); 
+	  punch_hole_map_update(tr, punch_hole_off, op_iov);
 
 	} // end of punch_hole_ops loop  
   } // end of tls loop
@@ -673,6 +665,23 @@ void FileContainer::queue_completions_thru(uint64_t seq)
 }
 
 
+void FileContainer::punch_hole_map_update(ObjectStore::Transaction& tr, uint32_t punch_hole_off, vector<buddy_iov_t>& op_iov)
+{
+  // 그냥 iovector 돌면서 Transaction::iov_t 만들어서 저장. 
+  string fname;
+  vector<ObjectStore::Transaction::iov_t> tr_iov;
+
+  for(vector<buddy_iov_t>::iterator iovp = op_iov.begin();
+	iovp != op_iov.end(); ++iovp) {
+
+	  fname = prefix_fn + to_string((*iovp).file_seq);
+	  tr_iov.push_back(ObjectStore::Transaction::iov_t(
+		fname, (*iovp).ooff, (*iovp).foff, (*iovp).bytes));
+  }
+  tr.punch_hole_map.insert(make_pair(punch_hole_off, tr_iov)); 
+}
+
+
 //----- oxt_map ----------//
 
 int FileContainer::oxt_map_update(vector<buddy_iov_t>& iov)
@@ -891,7 +900,7 @@ int FileContainer::sync()
   return oxt_map_db->submit_transaction_sync(t);
 }
 
-size_t FileContainer::get_size(ghobject_t& oid)
+size_t FileContainer::get_size(const coll_t& cid, const ghobject_t& oid)
 {
   return 0;
 }
@@ -936,7 +945,9 @@ int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
   string prefix = cid.to_str(); 
   string key = ghobject_key(oid);
 
-  // 사실은 여기에서 free_extent_map 에 넣어야 함. 읽어와서. 
+  
+  // object 가 차지하고 있던 공간을 회수하여 free extent map 에 추가 
+  // 해당 영역에 punch_hole 을 날릴지는 background thread 가 처리
   // YUIL
 
   if(oxt_map_db){
@@ -946,7 +957,24 @@ int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
   return 0;
 }
 
+int FileContainer::clone(const coll_t& cid, const ghobject_t& src, const ghobject_t& dest, uint64_t srcoff, uint64_t len, uint64_t dstoff)
+{
 
+  // src object 에서 dst 로 write 하라는 건데.. 
+  // 이거 transaction 에서 encoding 했을 때 어떻게 하는지? 
+  // src 에 정보가 있으니까 이건 log 에 데이터가 없을 것임. 
+  // 여기에서 실제 읽어와서 write 해야함. 
+
+  // 1. fc->read(src) to bl 
+  // 2. write 를 해야함 
+
+  return 0;
+}
+
+int FileContainer::truncate(const coll_t& cid, const ghobject_t& oid, uint64_t bytes) 
+{
+  return 0;
+};
 
 
 

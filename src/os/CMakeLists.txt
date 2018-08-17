@@ -25,7 +25,6 @@ set(libos_srcs
   buddystore/BuddyJournal.cc
   buddystore/BDJournalingObjectStore.cc
   buddystore/buddy_types.cc
-  buddystore/BuddyLogDataFileObject.cc
   buddystore/FileContainer.cc
   #  buddystore/BuddyHashIndexFile.cc
   #buddystore/BuddyFileStore.cc

@@ -37,7 +37,6 @@
 #include "../filestore/DBObjectMap.h"
 #include "../filestore/SequencerPosition.h"
 #include "kv/KeyValueDB.h"
-#include "BuddyLogDataFileObject.h"
 //#include "FileContainerObjectStore.h"
 #include "FileContainer.h"
 #include "buddy_types.h"
@@ -174,15 +173,6 @@ public:
     int bits;
     CephContext *cct;
 
-#ifndef FILE_CONTAINER
-    // -- data_file_map --
-    // 사실 이게.. buddy_index_map_t 를 Object 에 넣으면 되는건데
-    map<ghobject_t, buddy_index_map_t> data_file_index_map; // data_file_index_map  
-
-    int data_file_insert_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t foff, const uint64_t bytes); 
-    int data_file_get_index(const ghobject_t& oid, const uint64_t ooff, const uint64_t bytes, vector<buddy_iov_t>& iov);
-#endif
-
     bool use_page_set;
     bool data_hold_in_memory;
     ceph::unordered_map<ghobject_t, ObjectRef> object_hash;  ///< for lookup
@@ -221,19 +211,6 @@ public:
         object_map[oid] = result.first->second = create_object(); // 그럼 dnjsfo
       return result.first->second; // 있는 경우에는 그냥 있는거 return. 그걸 바꿔치기 한거니까. 
     }
-
-#ifndef FILE_CONTAINER
-    void encode_index(bufferlist& bl) const {
-      ENCODE_START(1, 1, bl);
-      ::encode(data_file_index_map, bl);
-      ENCODE_FINISH(bl);
-    }
-    void decode_index(bufferlist::iterator& p) {
-      DECODE_START(1, p);
-      ::decode(data_file_index_map, p);
-      DECODE_FINISH(p);
-    }
-#endif
 
     void encode(bufferlist& bl) const;
     void decode(bufferlist::iterator& p);
@@ -324,10 +301,6 @@ private:
   bool data_hold_in_memory;
   bool file_prewrite;
   bool file_inplace_write;
-
-  uint64_t last_data_file_seq;
-
-  BuddyLogDataFileObject data_file;
 
   bool debug_file_read;
 
@@ -433,13 +406,6 @@ private:
 				   TrackedOpRef osd_op);
 
 
-  /************************************
-   * journaling, data_write, do_transaction(parallel)
-   *
-   * **********************************/
-
-  void generate_iov_data_bl(vector<buddy_iov_t>& iov, bufferlist& bl, uint32_t start_off);
-  int generate_iov(vector<Transaction> &tls, vector<buddy_iov_t>& iov);
 
   ////////////////////////////////////////////////////
   // Journaling 
@@ -546,165 +512,34 @@ private:
   void op_queue_release_throttle(Op *o) {}
 
 
-  ////////////////////////////////////////////////////
-  // vector io workqueue 
-  //
-  ////////////////////////////////////////////////////
-  
-  deque<OpSequencer*> data_op_queue;
-
-  ThreadPool data_op_tp;
-
-  struct DataOpWQ : public ThreadPool::WorkQueue<OpSequencer> {
-
-    BuddyStore *store;
-    DataOpWQ(BuddyStore *fs, time_t timeout, time_t suicide_timeout, ThreadPool *tp)
-      : ThreadPool::WorkQueue<OpSequencer>("BuddyStore::DataOpWQ", timeout, suicide_timeout, tp), store(fs) {}
-
-    bool _enqueue(OpSequencer *osr) override {
-      store->data_op_queue.push_back(osr);
-      return true;
-    }
-    void _dequeue(OpSequencer *o) override {
-      ceph_abort();
-    }
-    bool _empty() override {
-      return store->data_op_queue.empty();
-    }
-    OpSequencer *_dequeue() override {
-      if (store->data_op_queue.empty())
-	return NULL;
-      OpSequencer *osr = store->data_op_queue.front();
-      store->data_op_queue.pop_front();
-      return osr;
-    }
-    void _process(OpSequencer *osr, ThreadPool::TPHandle &handle) override {
-      store->_do_data_op(osr, handle);
-    }
-    void _process_finish(OpSequencer *osr) override {
-      store->_finish_data_op(osr);
-    }
-    void _clear() override {
-      assert(store->data_op_queue.empty());
-    }
-  } data_op_wq;
-
-  void _do_data_op(OpSequencer *o, ThreadPool::TPHandle &handle);
-  void _finish_data_op(OpSequencer *o);
-  void queue_data_op(OpSequencer *osr, Op *o);
-  void data_op_queue_reserve_throttle(Op *o) {}
-  void data_op_queue_release_throttle(Op *o) {}
-
-  ////////////////////////////////////////////////////
-  //
-  // home_write_thread 
-  //
-  ////////////////////////////////////////////////////
-#if 0 
-  struct data_item {
-    OpSequencer *osr;
-    Context *finish;
-    utime_t start;
-
-    data_item(OpSequencer* _osr, Context *c, utime_t s)
-      : osr(_osr), finish(c), start(s) {}
-    data_item() : osr(0), finish(0), start(0) {}
-  };
-#endif
-  Mutex dataq_lock;
-  Cond dataq_cond;
-  list<OpSequencer*> dataq;
-
-
-  bool dataq_empty() {
-    Mutex::Locker l(dataq_lock);
-    return dataq.empty();
-  }
-  
-  void queue_dataq(OpSequencer* osr) {
-    Mutex::Locker l(dataq_lock);
-    dataq.push_back(osr);
-  }
-
-  OpSequencer* &peek_dataq(){ // front 
-    Mutex::Locker l(dataq_lock);
-    assert(!dataq.empty());
-    return dataq.front();
-  }
-
-  void pop_dataq(){ // front 
-    Mutex::Locker l(dataq_lock);
-    assert(!dataq.empty());
-    dataq.pop_front();
-  }
-  void batch_pop_dataq(list<OpSequencer*> &items){// 전체 다 가져오기 
-    Mutex::Locker l(dataq_lock); 
-    dataq.swap(items); 
-  }
-  void batch_unpop_dataq(list<OpSequencer*> &items){
-    Mutex::Locker l(dataq_lock);
-    dataq.splice(dataq.begin(), items);
-  }
-  
-  class DataWriteThread : public Thread {
-    BuddyStore *bs;
-  public:
-    explicit DataWriteThread(BuddyStore *bs_) : bs(bs_) {}
-    void *entry() override {
-      bs->data_write_thread_entry();
-      return 0;
-    }
-  } data_write_thread;
-
-
-  bool stop_data_write;
-
-  void data_write_thread_entry();
-
 
   ////////////////////////////////////////////////////
   // index writer  
   //
   ////////////////////////////////////////////////////
   
-  class IndexWriteThread : public Thread {
+  class DoApplyThread : public Thread {
     BuddyStore *bs;
   public:
-    explicit IndexWriteThread(BuddyStore *bs_) : bs(bs_) {}
+    explicit DoApplyThread(BuddyStore *bs_) : bs(bs_) {}
     void *entry() override {
-      bs->index_write_thread_entry();
+      bs->do_apply_thread_entry();
       return 0;
     }
-  } index_write_thread;
+  } do_apply_thread;
 
 
-  void index_write_thread_entry();
-  int index_write_sync();
+  void do_apply_thread_entry();
 
-  Mutex index_write_lock;
-  bool force_index_write; // protected by index_write_lock
-  bool stop_index_write; // protected by index_write_lock 
-  Cond index_write_cond; // protected by index_write_lock 
+  Mutex do_apply_lock;
+  bool force_do_apply; // protected by do_apply_lock
+  bool stop_do_apply; // protected by do_apply_lock 
+  Cond do_apply_cond; // protected by do_apply_lock 
 
-  double m_buddystore_index_sync_interval;
+  double m_buddystore_do_apply_interval;
 
   void do_force_sync(); 
 
-#if 0
-  // 원래 q 는 해당 thread 에게 work 를 만들어서 던질때 필요한건데
-  // index writer 의 경우에는.. 이미 있는 것들을 그냥 .. 쓰는 거니까. 필요없을듯. 
-  Mutex index_writeq_lock;
-  Cond index_writeq_cond; // 
-  list<Op*> index_writeq;
-  bool index_writeq_empty();
-#endif
-#if 0
-  Op &peek_index_write();
-  void pop_index_write();
-//  void batch_pop_write(list<write_item> &items);
-//  void batch_unpop_write(list<write_item> &items);
-
-#endif
 
   ////////////////////////////////////////////////////
   //

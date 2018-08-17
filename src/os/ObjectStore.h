@@ -522,7 +522,7 @@ public:
     vector<Op> punch_hole_ops;
     struct iov_t {
       string fname;
-	  uint64_t 
+	  uint64_t ooff;
       uint64_t foff;
       uint64_t bytes;
       //uint64_t tot_bytes;
@@ -535,7 +535,7 @@ public:
         bl.copy(sizeof(iov_t), (char*)this);
       }
 
-      iov_t(const string& fname_, uint64_t foff_, uint64_t bytes_ ) : 
+      iov_t(const string& fname_, uint64_t ooff_, uint64_t foff_, uint64_t bytes_ ) : 
 	fname(fname_),
 	foff(foff_),
 	bytes(bytes_)

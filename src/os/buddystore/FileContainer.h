@@ -35,7 +35,7 @@ class FileContainer{
   //map<uint64_t, size_t> file_tail_map; // <file_seq, tail_off>
   //map<uint64_t, int> file_fd_map; // <file_seq, fd>
 
-  // file 공간 할당받고 buffer align 맞추는 함수  
+ // file 공간 할당받고 buffer align 맞추는 함수  
   Mutex fc_lock;
   uint64_t file_seq; // 0 is invalid 
   uint64_t curr_tail_off; 
@@ -50,6 +50,10 @@ class FileContainer{
 //  string fname;
 
 public:
+  // stat
+  uint64_t total_alloc_bytes;
+  uint64_t total_stored_bytes;
+ 
   Finisher fc_finisher;
   //Finisher* finisher;
 
@@ -228,10 +232,10 @@ public:
   } submit_manager;
 
   int prepare_write(vector<ObjectStore::Transaction> &tls, vector<buddy_iov_t>& iov); 
-  int transaction_update(vector<ObjectStore::Transaction> &tls, vector<buddy_iov_t>& iov); // add map info to tr.
 
   void submit_entry(uint64_t seq, vector<buddy_iov_t>& iov, Context* onfcwrite, TrackedOpRef osd_op = TrackedOpRef()); 
   void queue_completions_thru(uint64_t written_seq);
+  void punch_hole_map_update(ObjectStore::Transaction& tr, uint32_t punch_hole_off, vector<buddy_iov_t>& iov); // add map info to tr.
 
   int oxt_map_update (vector<buddy_iov_t>& iov);
   int oxt_map_single_update(buddy_iov_t& iov);
@@ -239,12 +243,13 @@ public:
 
   int sync(); 
   // object operations 
-  size_t get_size(ghobject_t& oid);
+  uint64_t get_size(const coll_t& cid, const ghobject_t& oid);
+
   int read(const coll_t& cid, const ghobject_t& oid, uint64_t offset, uint64_t len, bufferlist &bl);
   int remove(const coll_t& cid, const ghobject_t& oid);
-  int write(uint64_t offset, const bufferlist &bl){return 0;};
-  //int clone(ghobject_t& src, ghobject_t& dest, uint64_t srcoff, uint64_t len, uint64_t dstoff) {};
-  //int truncate(ghobject_t& oid, uint64_t offset) {};
+  int write(const coll_t& cid, const ghobject_t& oid, uint64_t offset, const bufferlist &bl){return 0;};
+  int clone(const coll_t& cid, const ghobject_t& src, const ghobject_t& dest, uint64_t srcoff, uint64_t len, uint64_t dstoff);
+  int truncate(const coll_t& cid, const ghobject_t& oid, uint64_t bytes);
 
   void encode(bufferlist& bl) const 
   {
@@ -273,6 +278,8 @@ public:
 	curr_tail_off(0),
 	directio(dio),
 	prewrite(cct->_conf->buddystore_file_prewrite),
+	total_alloc_bytes(0),
+	total_stored_bytes(0),
 	fc_finisher(cct, "BuddyStore", "fn_bd_fc"),
 	write_thread(this), 
 	write_stop(false),
