@@ -830,22 +830,22 @@ int BuddyStore::read(
     return 0;
   }
 
-  size_t l = len;
-  if (l == 0 && offset == 0)  // note: len == 0 means read the entire object
-    l = o->get_size();
-  else if (offset + l > o->get_size())
-    l = o->get_size() - offset;
+  size_t _len = len;
+  if (_len == 0 && offset == 0)  // note: len == 0 means read the entire object
+    _len = o->get_size();
+  else if (offset + _len > o->get_size())
+    _len = o->get_size() - offset;
   bl.clear();
 
   int ret = 0; 
 
-  dout(10) << __func__ << " len " << l << dendl;
+  dout(10) << __func__ << " len " << _len << dendl;
 
   bufferlist mbl, fbl;
 
   if (data_hold_in_memory){
     dout(10) << __func__ << " data_hold_in_memory " << dendl; 
-    ret = o->read(offset, l, mbl);
+    ret = o->read(offset, _len, mbl);
   }
   
 // FILE_CONTAINER
@@ -853,8 +853,12 @@ int BuddyStore::read(
   // 여기 내려오면 data_hold_in_memory 가 아니거나 debug 를 해야하는 상황. 
   if (!data_hold_in_memory) { // data_flush 
 	assert(data_flush);
-	ret = fc->read(c->cid, oid, offset, len, fbl);
+	ret = fc->read(c->cid, oid, offset, _len, fbl);
+	dout(3) << __func__ << " read_bytes " << ret << dendl;
 
+#if 0
+	// 이건 data_hold_in_memory 일때만 가능한 건데 지금은 hold_in_memory 가 아닐때만 읽어오도록 했으니까. 
+	// 나중에 하기 
 	if(debug_file_read) {
 	  const char *sptr, *mptr;
 	  bufferlist::iterator sp = fbl.begin();
@@ -866,6 +870,7 @@ int BuddyStore::read(
 	  int cmp = memcmp(sptr,mptr,10);
 	  assert(cmp == 0);
 	}
+#endif
 
 	bl.claim(fbl);
 	return ret;
@@ -1655,7 +1660,7 @@ void BuddyStore::_do_transaction(Transaction& t, uint64_t op_seq,
     case Transaction::OP_WRITE:
 	  {
 		//EUNJI 
-		dout(10) << " punch_hole_ops " << t.punch_hole_ops.size() << dendl;
+		dout(10) << __func__ << " punch_hole_ops " << t.punch_hole_ops.size() << dendl;
 		assert(t.punch_hole_ops.size() > 0);
 
 		coll_t cid = i.get_cid(op->cid);

@@ -37,7 +37,8 @@ int FileContainer::mkfc()
 	dout(1) << __func__ << " Failed to create file" << dendl;
 	return fd;
   }
-  
+  dout(3) << __func__ << " container file is created with fd = " << fd << dendl;
+
   int ret = _set_tail_off(fd);
   if (ret < 0) {
 	dout(1) << __func__ << " Failed to set tail off" << dendl;
@@ -147,9 +148,11 @@ void FileContainer::mount()
 
   _load();
 
+  dout(3) << __func__ << " mkdir " << extent_map_dir.c_str() << dendl;
   int ret = ::mkdir(extent_map_dir.c_str(), 0777);
-  if(ret < 0)
+  if(ret < 0){
 	dout(3) << "mkdir return = " << ret << dendl;
+  }
 
   // kvstore for extent map 
   oxt_map_db = KeyValueDB::create(cct, extent_map_backend, extent_map_dir);
@@ -178,6 +181,36 @@ void FileContainer::mount()
 	  return;
   }
   dout(3) << "Success open oxt_map" << dendl;
+
+
+  // kvstore for free extent map
+  free_extent_map_db = KeyValueDB::create(cct, extent_map_backend, free_extent_map_dir);
+
+  if(free_extent_map_db == NULL) {
+	dout(3) << "Failed to oxt_map " << dendl; 
+	return;
+  }
+
+  if (extent_map_backend == "rocksdb")
+    ret = free_extent_map_db->init(cct->_conf->filestore_rocksdb_options);
+  else
+    ret = free_extent_map_db->init();
+
+  if (ret < 0) {
+    derr << "Error initializing oxt_map: " << cpp_strerror(ret) << dendl;
+	return;
+  }
+    
+  if (free_extent_map_db->create_and_open(err)) {
+      delete free_extent_map_db;
+      derr << "Error initializing " << extent_map_backend
+	   << " : " << err.str() << dendl;
+      ret = -1;
+	  return;
+  }
+  dout(3) << "Success open free_extent_map_db" << dendl;
+
+
 
   // start finisher 
   fc_finisher.start();
@@ -263,13 +296,28 @@ string FileContainer::ghobject_key(const ghobject_t &oid)
 int FileContainer::_write(buddy_iov_t& iov)
 {
   dout(3) << __func__ << " iov " << iov << dendl;
+
   string fname = prefix_fn + to_string(iov.file_seq);
+  int flags = O_RDWR | O_CREAT;
+  if (directio) {
+	flags |= O_DIRECT | O_DSYNC;
+  }
   
-  int fd = _create_or_open_file(fname, O_DIRECT | O_DSYNC | O_CREAT);
+  //int fd = _create_or_open_file(fname, O_DIRECT | O_DSYNC | O_CREAT);
+  int fd = _create_or_open_file(fname, flags);
   dout(3) << __func__ << " fname " << fname << " fd " << fd << dendl;
 
-  // 어차피 bl 에 있는거 쓰게 되어 있음. 
-  int r = iov.data_bl.write_fd(fd, iov.foff); 
+  int r;
+  if(directio){
+	bufferlist abl;
+	abl.claim_append(iov.data_bl);
+	abl.rebuild_aligned(CEPH_DIRECTIO_ALIGNMENT);
+	r = abl.write_fd(fd, iov.foff);
+  } else 
+	r = iov.data_bl.write_fd(fd, iov.foff); 
+
+  dout(3) << __func__ << " fname " << fname << " fd " << fd << " completed " << r << dendl;
+
   if (r) {
 	dout(3) << __func__ << " Failed to write with " << r << dendl;
 	return r;
@@ -282,8 +330,10 @@ int FileContainer::_read(int fd, buddy_iov_t& iov)
 {
   bufferlist ebl;
 
+#if 0
   if (directio)
 	ebl.rebuild_aligned(CEPH_DIRECTIO_ALIGNMENT);
+#endif
   //  iov.data_bl.rebuild_aligned(CEPH_DIRECTIO_ALIGNMENT);
 
   // for test 
@@ -292,6 +342,7 @@ int FileContainer::_read(int fd, buddy_iov_t& iov)
   uint64_t foff = iov.foff;
   uint64_t len = iov.bytes;
 
+  dout(3) << __func__ << " fd " << fd << " boff " << boff << " blen " << blen << dendl;
   int ret = ebl.read_fd(fd, boff, blen);
   iov.data_bl.substr_of(ebl, foff - boff, len);
   ret = iov.data_bl.length();
@@ -598,7 +649,8 @@ void FileContainer::write_thread_entry()
 		start = ceph_clock_now(); 
 
 		// 이거 나중에 풀기 
-		//int ret = _write(iov);
+		dout (3) << __func__ << " " << iov << dendl; 
+		int ret = _write(iov);
 
 		lat = ceph_clock_now();
 		lat -= start;
@@ -689,6 +741,7 @@ int FileContainer::oxt_map_update(vector<buddy_iov_t>& iov)
   for(vector<buddy_iov_t>::iterator p = iov.begin(); 
 	p != iov.end(); ++p) 
   {
+	dout(3) << __func__ << " " << *p << dendl;
 	int r = oxt_map_single_update(*p);
 	if ( r < 0 ) {
 	  dout(3) << "Failed to update map" << dendl;
@@ -792,11 +845,31 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
   }
 
   //delete_index:
-  for(auto p = delete_list.begin(); p != delete_list.end() ; p++){
-    dout(10) << __func__ << " delete : " << *p << dendl;
-    omap.erase(*p);
+  for(auto ooff_p = delete_list.begin(); ooff_p != delete_list.end() ; ooff_p++){
+    dout(10) << __func__ << " delete : " << *ooff_p << dendl;
 
 	// YUIL: add free list 
+	// free extent 로 되는 거니까 이거 달기 <foff,  
+	buddy_iov_t iov;
+	map<uint64_t, buddy_iov_t>::iterator entry_p = omap.find(*ooff_p);
+
+	assert(entry_p != omap.end());
+
+	iov = entry_p->second;
+	dout(10) << __func__ << " iov " << iov << dendl;
+
+	// encode 
+	string prefix = prefix_fn + to_string(iov.file_seq);
+	string key = to_string(iov.foff);
+	bufferlist bl; 
+	::encode(iov.bytes, bl);
+
+	KeyValueDB::Transaction t = free_extent_map_db->get_transaction();
+	t->set(prefix, key, bl);
+	free_extent_map_db->submit_transaction(t);
+
+	// omap 에서 삭제 
+    omap.erase(*ooff_p); // omap 에서는 지움. ooff 가 key 가 됨. 
   }
 
   //insert_partial_index:
@@ -823,6 +896,7 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   // entry 를 넣을 때는 기존의 entry 를 읽기는 하는데 어차피 entry 만 읽어서
   // 겹치는 부분 삭제하고 다시 추가하니까 실제 데이터를 읽어오는 것 까지는
   // 필요없음. 원래 구현했던 함수에서는 vector<buddy_iov_t> 를 보내서 거기에 io 정보 받아오도록 함. 
+  dout(3) << __func__ << " cid " << cid << " oid " << oid << " ooff " << ooff << " len " << len << dendl;
 
   map<uint64_t, buddy_iov_t> omap;  
 
@@ -846,8 +920,9 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   uint64_t bytes = 0;
   uint64_t peoff = 0;
 
-  // search starts from the first smaller offset than the target 
+  dout(3) << __func__ << " oxt_map size = " << omap.size() << " soff " << soff << dendl;
 
+  // search starts from the first smaller offset than the target 
   map<uint64_t, buddy_iov_t>::iterator p = omap.upper_bound(soff);
 
   // if p is same as omap.begin() and omap.end(), omap is empty. 이건 위에서
@@ -857,7 +932,6 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   // 않는 걸로 정리. 아래의 assert 문은 hole 이 있는 경우를 체크하는 것임. 
 
   assert(p != omap.begin());
-
   p--;
 
   while(rbytes > 0) {
@@ -909,9 +983,11 @@ size_t FileContainer::get_size(const coll_t& cid, const ghobject_t& oid)
 //---- read -----// 
 int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, uint64_t len, bufferlist &bl)
 {
+  dout(3) << __func__ << " cid " << cid << " oid " << oid << " off " << off << " len " << len << dendl; 
   // map 정보 읽어와서 실제 bl 에 담아주면 됨. 
   vector<buddy_iov_t> iov;
   int ret = oxt_map_lookup(cid, oid, off, len, iov); 
+
   if (ret < 0) // not found 
 	return 0;
 
@@ -921,17 +997,20 @@ int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, 
   int fd; 
 
   for(auto ip = iov.begin(); ip != iov.end(); ++ip){
-
 	// open file 
 	fname = prefix_fn + to_string(ip->file_seq);
 	fd = _create_or_open_file(fname, 0);
-	ret = _read (fd, (*ip)); // iov 가 const 아니어도 넘어가는지 모르겠음. 
 
+	dout(3) << __func__ << " data_bl " << (*ip).data_bl.length() << dendl;
+	ret = _read (fd, (*ip)); // iov 가 const 아니어도 넘어가는지 모르겠음. 
 	// 읽어온 거를 다 붙여서 저장해야할듯. 
 	bl.claim_append((*ip).data_bl);
   }
   dout(3) << __func__ << " requested: " << len << " read: " << bl.length() << dendl;
-  return bl.length();
+  //return bl.length();
+  //ret = bl.length();
+
+  return ret;
 }
 
 
@@ -944,15 +1023,40 @@ int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
 
   string prefix = cid.to_str(); 
   string key = ghobject_key(oid);
+  bufferlist bl;
 
-  
   // object 가 차지하고 있던 공간을 회수하여 free extent map 에 추가 
   // 해당 영역에 punch_hole 을 날릴지는 background thread 가 처리
   // YUIL
+  oxt_map_db->get(prefix, key, &bl);
+  if(bl.length() == 0)
+	return 0;
 
+  bufferlist::iterator bp = bl.begin(); 
+  ::decode(omap, bp);
+
+  for (auto p = omap.begin(); p != omap.end(); ++p){
+	  	// encode 
+	string _prefix = prefix_fn + to_string(p->second.file_seq);
+	string _key = to_string(p->second.foff);
+
+	bufferlist _bl; 
+	::encode(p->second.bytes, _bl);
+
+	KeyValueDB::Transaction t = free_extent_map_db->get_transaction();
+	t->set(_prefix, _key, _bl);
+	free_extent_map_db->submit_transaction(t);
+  }
+
+
+  // 삭제 
   if(oxt_map_db){
 	KeyValueDB::Transaction t = oxt_map_db->get_transaction(); 
+
 	t->rmkey(prefix, key);	
+
+
+
   }
   return 0;
 }

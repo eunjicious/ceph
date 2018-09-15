@@ -1323,6 +1323,8 @@ OPTION(journal_replay_from, OPT_INT, 0)
 OPTION(journal_zero_on_create, OPT_BOOL, false)
 OPTION(journal_ignore_corruption, OPT_BOOL, false) // assume journal is not corrupt
 OPTION(journal_discard, OPT_BOOL, false) //using ssd disk as journal, whether support discard nouse journal-data.
+OPTION(journal_actual_write, OPT_BOOL, true) // EUNJI: do not journal data (for analysis)
+
 
 // EUNJI
 OPTION(buddystore_data_directio, OPT_BOOL, true)

@@ -1929,7 +1929,8 @@ KStore::TransContext *KStore::_txc_create(OpSequencer *osr)
 void KStore::_txc_state_proc(TransContext *txc)
 {
   while (true) {
-    dout(10) << __func__ << " txc " << txc
+    //dout(10) << __func__ << " txc " << txc // EUNJI 
+    dout(5) << __func__ << " txc " << txc
 	     << " " << txc->get_state_name() << dendl;
     switch (txc->state) {
     case TransContext::STATE_PREPARE:
@@ -2018,6 +2019,13 @@ void KStore::_txc_finish_kv(TransContext *txc)
 
   throttle_ops.put(txc->ops);
   throttle_bytes.put(txc->bytes);
+
+  // EUNJI 
+  utime_t lat = ceph_clock_now() - txc->txc_start; 
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl; 
+
+  Formatter *f = Formatter::create("json-pretty");
+  dump_perf_counters(f);
 }
 
 void KStore::_txc_finish(TransContext *txc)
@@ -2887,6 +2895,10 @@ int KStore::_setattr(TransContext *txc,
 		     const string& name,
 		     bufferptr& val)
 {
+
+// EUNJI
+  utime_t start = ceph_clock_now();
+
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " " << name << " (" << val.length() << " bytes)"
 	   << dendl;
@@ -2896,6 +2908,11 @@ int KStore::_setattr(TransContext *txc,
   dout(10) << __func__ << " " << c->cid << " " << o->oid
 	   << " " << name << " (" << val.length() << " bytes)"
 	   << " = " << r << dendl;
+//EUNJI
+  utime_t done = ceph_clock_now();
+  utime_t lat = done - start;
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
+
   return r;
 }
 
@@ -2904,6 +2921,10 @@ int KStore::_setattrs(TransContext *txc,
 		      OnodeRef& o,
 		      const map<string,bufferptr>& aset)
 {
+
+// EUNJI
+  utime_t start = ceph_clock_now();
+
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " " << aset.size() << " keys"
 	   << dendl;
@@ -2919,6 +2940,11 @@ int KStore::_setattrs(TransContext *txc,
   dout(10) << __func__ << " " << c->cid << " " << o->oid
 	   << " " << aset.size() << " keys"
 	   << " = " << r << dendl;
+//EUNJI
+  utime_t done = ceph_clock_now();
+  utime_t lat = done - start;
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
+
   return r;
 }
 
@@ -2987,6 +3013,10 @@ int KStore::_omap_setkeys(TransContext *txc,
 			  bufferlist &bl)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid << dendl;
+
+// EUNJI
+  utime_t start = ceph_clock_now();
+
   int r;
   bufferlist::iterator p = bl.begin();
   __u32 num;
@@ -3008,6 +3038,12 @@ int KStore::_omap_setkeys(TransContext *txc,
   }
   r = 0;
   dout(10) << __func__ << " " << c->cid << " " << o->oid << " = " << r << dendl;
+
+  //EUNJI
+  utime_t done = ceph_clock_now();
+  utime_t lat = done - start;
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
+
   return r;
 }
 
@@ -3374,6 +3410,12 @@ int KStore::_split_collection(TransContext *txc,
   dout(10) << __func__ << " " << c->cid << " to " << d->cid << " "
 	   << " bits " << bits << " = " << r << dendl;
   return r;
+}
+
+// EUNJI 
+void KStore::get_db_statistics(Formatter *f)
+{
+  db->get_statistics(f);
 }
 
 // ===========================================

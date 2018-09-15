@@ -1170,8 +1170,12 @@ int MemStore::_setattrs(const coll_t& cid, const ghobject_t& oid,
   if (!o)
     return -ENOENT;
   std::lock_guard<std::mutex> lock(o->xattr_mutex);
-  for (map<string,bufferptr>::const_iterator p = aset.begin(); p != aset.end(); ++p)
+  for (map<string,bufferptr>::const_iterator p = aset.begin(); p != aset.end(); ++p){
+	dout(10) << __func__ << " [EUNJI] " << p->first << dendl;
     o->xattr[p->first] = p->second;
+  }
+//  for (map<string,bufferptr>::const_iterator p = aset.begin(); p != aset.end(); ++p)
+//    o->xattr[p->first] = p->second;
   return 0;
 }
 
@@ -1301,6 +1305,7 @@ int MemStore::_omap_setkeys(const coll_t& cid, const ghobject_t &oid,
     string key;
     ::decode(key, p);
     ::decode(o->omap[key], p);
+	dout(10) << __func__ << " [EUNJI] " << key << dendl;
   }
   return 0;
 }

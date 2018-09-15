@@ -732,6 +732,12 @@ int FileStore::statfs(struct store_statfs_t *buf0)
 
 void FileStore::new_journal()
 {
+// EUNJI   
+  if(!cct->_conf->filestore_journal_enable) {
+	dout(3) << " filestore_journal_enable is false " << dendl;
+	return;
+  }
+
   if (journalpath.length()) {
     dout(10) << "open_journal at " << journalpath << dendl;
     journal = new FileJournal(cct, fsid, &finisher, &sync_cond,
@@ -2030,6 +2036,8 @@ void FileStore::_finish_op(OpSequencer *osr)
   dout(10) << "_finish_op " << o << " seq " << o->op << " " << *osr << "/" << osr->parent << " lat " << lat << dendl;
   osr->apply_lock.Unlock();  // locked in _do_op
 
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
+
   // called with tp lock held
   op_queue_release_throttle(o);
 
@@ -2045,6 +2053,11 @@ void FileStore::_finish_op(OpSequencer *osr)
     apply_finishers[osr->id % m_apply_finisher_num]->queue(to_queue);
   }
   delete o;
+
+  // EUNJI
+  //Formatter *f = Formatter::create("json-pretty");
+  //dump_perf_counters(f);
+
 }
 
 
@@ -4443,6 +4456,8 @@ int FileStore::_setattrs(const coll_t& cid, const ghobject_t& oid, map<string,bu
   FDRef fd;
   int spill_out = -1;
   bool incomplete_inline = false;
+// EUNJI
+  utime_t start = ceph_clock_now();
 
   int r = lfn_open(cid, oid, false, &fd);
   if (r < 0) {
@@ -4468,6 +4483,8 @@ int FileStore::_setattrs(const coll_t& cid, const ghobject_t& oid, map<string,bu
        ++p) {
     char n[CHAIN_XATTR_MAX_NAME_LEN];
     get_attrname(p->first.c_str(), n, CHAIN_XATTR_MAX_NAME_LEN);
+	// EUNJI 
+	dout(3) << __func__ << " key " << p->first.c_str() << dendl;
 
     if (incomplete_inline) {
       chain_fremovexattr(**fd, n); // ignore any error
@@ -4529,6 +4546,11 @@ int FileStore::_setattrs(const coll_t& cid, const ghobject_t& oid, map<string,bu
   lfn_close(fd);
  out:
   dout(10) << "setattrs " << cid << "/" << oid << " = " << r << dendl;
+
+  //EUNJI
+  utime_t done = ceph_clock_now();
+  utime_t lat = done - start;
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
   return r;
 }
 
@@ -5410,6 +5432,15 @@ int FileStore::_omap_setkeys(const coll_t& cid, const ghobject_t &hoid,
   dout(15) << __func__ << " " << cid << "/" << hoid << dendl;
   Index index;
   int r;
+
+// EUNJI
+  utime_t start = ceph_clock_now();
+  utime_t done, lat;
+
+  for (auto& p : aset) {
+      dout(5) << __func__ << " set " << p.first << dendl;
+  }
+
   //treat pgmeta as a logical object, skip to check exist
   if (hoid.is_pgmeta())
     goto skip;
@@ -5436,6 +5467,11 @@ skip:
   }
   r = object_map->set_keys(hoid, aset, &spos);
   dout(20) << __func__ << " " << cid << "/" << hoid << " = " << r << dendl;
+// EUNJI 
+  done = ceph_clock_now();
+  lat = done - start;
+  dout(3) << __func__ << " [EUNJI_TIME] lat = " << lat << dendl;
+
   return r;
 }
 
@@ -5508,6 +5544,8 @@ int FileStore::_split_collection(const coll_t& cid,
 				 coll_t dest,
 				 const SequencerPosition &spos)
 {
+  // EUNJI 
+  dout(3) << __func__ << " [EUNJI] " << cid << " bits: " << bits << dendl;
   int r;
   {
     dout(15) << __func__ << " " << cid << " bits: " << bits << dendl;

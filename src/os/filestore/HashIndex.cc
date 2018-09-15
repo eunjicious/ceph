@@ -704,6 +704,7 @@ bool HashIndex::must_merge(const subdir_info_s &info) {
 }
 
 bool HashIndex::must_split(const subdir_info_s &info) {
+// EUNJI 
   return (info.hash_level < (unsigned)MAX_HASH_LEVEL &&
 	  info.objs > ((unsigned)(abs(merge_threshold)) * 16 * split_multiplier));
 

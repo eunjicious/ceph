@@ -243,6 +243,7 @@ private:
   off64_t read_pos;       //
   bool discard;	  //for block journal whether support discard
 
+#if 0
 #ifdef HAVE_LIBAIO
   /// state associated with an in-flight aio request
   /// Protected by aio_lock
@@ -271,6 +272,7 @@ private:
   uint64_t aio_write_queue_ops;
   uint64_t aio_write_queue_bytes;
   /// End protected by aio_lock
+#endif
 #endif
 
   uint64_t last_committed_seq;
@@ -403,12 +405,14 @@ private:
     must_write_header(false),
     write_pos(0), read_pos(0),
     discard(false),
+#if 0
 #ifdef HAVE_LIBAIO
     aio_lock("FileJournal::aio_lock"),
     aio_ctx(0),
     aio_num(0), aio_bytes(0),
     aio_write_queue_ops(0),
     aio_write_queue_bytes(0),
+#endif
 #endif
     last_committed_seq(0),
     journaled_since_start(0),
@@ -426,11 +430,13 @@ private:
 	lderr(cct) << "FileJournal::_open_any: aio not supported without directio; disabling aio" << dendl;
         aio = false;
       }
+#if 0
 #ifndef HAVE_LIBAIO
       if (aio) {
 	lderr(cct) << "FileJournal::_open_any: libaio not compiled in; disabling aio" << dendl;
         aio = false;
       }
+#endif
 #endif
 
       cct->_conf->add_observer(this);

@@ -106,6 +106,7 @@ int FileJournal::_open(bool forwrite, bool create)
   if (ret)
     goto out_fd;
 
+#if 0
 #ifdef HAVE_LIBAIO
   if (aio) {
     aio_ctx = 0;
@@ -124,6 +125,7 @@ int FileJournal::_open(bool forwrite, bool create)
       goto out_fd;
     }
   }
+#endif
 #endif
 
   /* We really want max_size to be a multiple of block_size. */
@@ -633,9 +635,11 @@ void FileJournal::start_writer()
   write_stop = false;
   aio_stop = false;
   write_thread.create("journal_write");
+#if 0
 #ifdef HAVE_LIBAIO
   if (aio)
     write_finish_thread.create("journal_wrt_fin");
+#endif
 #endif
 }
 
@@ -658,7 +662,7 @@ void FileJournal::stop_writer()
     // write journal header now so that we have less to replay on remount
     write_header_sync();
   }
-
+#if 0
 #ifdef HAVE_LIBAIO
   // stop aio completeion thread *after* writer thread has stopped
   // and has submitted all of its io
@@ -670,6 +674,7 @@ void FileJournal::stop_writer()
     aio_lock.Unlock();
     write_finish_thread.join();
   }
+#endif
 #endif
 }
 
@@ -826,6 +831,7 @@ int FileJournal::prepare_multi_write(bufferlist& bl, uint64_t& orig_ops, uint64_
       int r = prepare_single_write(*it, bl, queue_pos, orig_ops, orig_bytes);
       if (r == 0) { // prepare ok, delete it
 	items.erase(it++);
+#if 0
 #ifdef HAVE_LIBAIO
 	{
 	  Mutex::Locker locker(aio_lock);
@@ -834,6 +840,7 @@ int FileJournal::prepare_multi_write(bufferlist& bl, uint64_t& orig_ops, uint64_
 	  assert(aio_write_queue_bytes >= bytes);
 	  aio_write_queue_bytes -= bytes;
 	}
+#endif
 #endif
       }
       if (r == -ENOSPC) {
@@ -1009,10 +1016,15 @@ int FileJournal::write_bl(off64_t& pos, bufferlist& bl)
     derr << "FileJournal::write_bl : lseek64 failed " << cpp_strerror(ret) << dendl;
     return ret;
   }
+
+  // EUNJI 
+  if(cct->_conf->journal_actual_write){
+	dout(5) << __func__ << " journal_actual_write is true " << dendl;
   ret = bl.write_fd(fd);
   if (ret) {
     derr << "FileJournal::write_bl : write_fd failed: " << cpp_strerror(ret) << dendl;
     return ret;
+  }
   }
   pos += bl.length();
   if (pos == header.max_size)
@@ -1022,159 +1034,161 @@ int FileJournal::write_bl(off64_t& pos, bufferlist& bl)
 
 void FileJournal::do_write(bufferlist& bl)
 {
-  // nothing to do?
-  if (bl.length() == 0 && !must_write_header)
-    return;
 
-  buffer::ptr hbp;
-  if (cct->_conf->journal_write_header_frequency &&
-      (((++journaled_since_start) %
-	cct->_conf->journal_write_header_frequency) == 0)) {
-    must_write_header = true;
-  }
 
-  if (must_write_header) {
-    must_write_header = false;
-    hbp = prepare_header();
-  }
+	// nothing to do?
+	if (bl.length() == 0 && !must_write_header)
+	  return;
 
-  dout(15) << "do_write writing " << write_pos << "~" << bl.length()
-	   << (hbp.length() ? " + header":"")
-	   << dendl;
+	buffer::ptr hbp;
+	if (cct->_conf->journal_write_header_frequency &&
+		(((++journaled_since_start) %
+		  cct->_conf->journal_write_header_frequency) == 0)) {
+	  must_write_header = true;
+	}
 
-  utime_t from = ceph_clock_now();
+	if (must_write_header) {
+	  must_write_header = false;
+	  hbp = prepare_header();
+	}
 
-  // entry
-  off64_t pos = write_pos;
+	dout(15) << "do_write writing " << write_pos << "~" << bl.length()
+	  << (hbp.length() ? " + header":"")
+	  << dendl;
 
-  // Adjust write_pos
-  write_pos += bl.length();
-  if (write_pos >= header.max_size)
-    write_pos = write_pos - header.max_size + get_top();
+	utime_t from = ceph_clock_now();
 
-  write_lock.Unlock();
+	// entry
+	off64_t pos = write_pos;
 
-  // split?
-  off64_t split = 0;
-  if (pos + bl.length() > header.max_size) {
-    bufferlist first, second;
-    split = header.max_size - pos;
-    first.substr_of(bl, 0, split);
-    second.substr_of(bl, split, bl.length() - split);
-    assert(first.length() + second.length() == bl.length());
-    dout(10) << "do_write wrapping, first bit at " << pos << " len " << first.length()
-	     << " second bit len " << second.length() << " (orig len " << bl.length() << ")" << dendl;
+	// Adjust write_pos
+	write_pos += bl.length();
+	if (write_pos >= header.max_size)
+	  write_pos = write_pos - header.max_size + get_top();
 
-    //Save pos to write first piece second
-    off64_t first_pos = pos;
-    off64_t orig_pos;
-    pos = get_top();
-    // header too?
-    if (hbp.length()) {
-      // be sneaky: include the header in the second fragment
-      second.push_front(hbp);
-      pos = 0;          // we included the header
-    }
-    // Write the second portion first possible with the header, so
-    // do_read_entry() won't even get a valid entry_header_t if there
-    // is a crash between the two writes.
-    orig_pos = pos;
-    if (write_bl(pos, second)) {
-      derr << "FileJournal::do_write: write_bl(pos=" << orig_pos
-	   << ") failed" << dendl;
-      check_align(pos, second);
-      ceph_abort();
-    }
-    orig_pos = first_pos;
-    if (write_bl(first_pos, first)) {
-      derr << "FileJournal::do_write: write_bl(pos=" << orig_pos
-	   << ") failed" << dendl;
-      check_align(first_pos, first);
-      ceph_abort();
-    }
-    assert(first_pos == get_top());
-  } else {
-    // header too?
-    if (hbp.length()) {
-      if (TEMP_FAILURE_RETRY(::pwrite(fd, hbp.c_str(), hbp.length(), 0)) < 0) {
-	int err = errno;
-	derr << "FileJournal::do_write: pwrite(fd=" << fd
-	     << ", hbp.length=" << hbp.length() << ") failed :"
-	     << cpp_strerror(err) << dendl;
-	ceph_abort();
-      }
-    }
+	write_lock.Unlock();
 
-    if (write_bl(pos, bl)) {
-      derr << "FileJournal::do_write: write_bl(pos=" << pos
-	   << ") failed" << dendl;
-      check_align(pos, bl);
-      ceph_abort();
-    }
-  }
+	// split?
+	off64_t split = 0;
+	if (pos + bl.length() > header.max_size) {
+	  bufferlist first, second;
+	  split = header.max_size - pos;
+	  first.substr_of(bl, 0, split);
+	  second.substr_of(bl, split, bl.length() - split);
+	  assert(first.length() + second.length() == bl.length());
+	  dout(10) << "do_write wrapping, first bit at " << pos << " len " << first.length()
+		<< " second bit len " << second.length() << " (orig len " << bl.length() << ")" << dendl;
 
-  if (!directio) {
-    dout(20) << "do_write fsync" << dendl;
+	  //Save pos to write first piece second
+	  off64_t first_pos = pos;
+	  off64_t orig_pos;
+	  pos = get_top();
+	  // header too?
+	  if (hbp.length()) {
+		// be sneaky: include the header in the second fragment
+		second.push_front(hbp);
+		pos = 0;          // we included the header
+	  }
+	  // Write the second portion first possible with the header, so
+	  // do_read_entry() won't even get a valid entry_header_t if there
+	  // is a crash between the two writes.
+	  orig_pos = pos;
+	  if (write_bl(pos, second)) {
+		derr << "FileJournal::do_write: write_bl(pos=" << orig_pos
+		  << ") failed" << dendl;
+		check_align(pos, second);
+		ceph_abort();
+	  }
+	  orig_pos = first_pos;
+	  if (write_bl(first_pos, first)) {
+		derr << "FileJournal::do_write: write_bl(pos=" << orig_pos
+		  << ") failed" << dendl;
+		check_align(first_pos, first);
+		ceph_abort();
+	  }
+	  assert(first_pos == get_top());
+	} else {
+	  // header too?
+	  if (hbp.length()) {
+		if (TEMP_FAILURE_RETRY(::pwrite(fd, hbp.c_str(), hbp.length(), 0)) < 0) {
+		  int err = errno;
+		  derr << "FileJournal::do_write: pwrite(fd=" << fd
+			<< ", hbp.length=" << hbp.length() << ") failed :"
+			<< cpp_strerror(err) << dendl;
+		  ceph_abort();
+		}
+	  }
 
-    /*
-     * We'd really love to have a fsync_range or fdatasync_range and do a:
-     *
-     *  if (split) {
-     *    ::fsync_range(fd, header.max_size - split, split)l
-     *    ::fsync_range(fd, get_top(), bl.length() - split);
-     *  else
-     *    ::fsync_range(fd, write_pos, bl.length())
-     *
-     * NetBSD and AIX apparently have it, and adding it to Linux wouldn't be
-     * too hard given all the underlying infrastructure already exist.
-     *
-     * NOTE: using sync_file_range here would not be safe as it does not
-     * flush disk caches or commits any sort of metadata.
-     */
-    int ret = 0;
+	  if (write_bl(pos, bl)) {
+		derr << "FileJournal::do_write: write_bl(pos=" << pos
+		  << ") failed" << dendl;
+		check_align(pos, bl);
+		ceph_abort();
+	  }
+	}
+
+	if (!directio) {
+	  dout(20) << "do_write fsync" << dendl;
+
+	  /*
+	   * We'd really love to have a fsync_range or fdatasync_range and do a:
+	   *
+	   *  if (split) {
+	   *    ::fsync_range(fd, header.max_size - split, split)l
+	   *    ::fsync_range(fd, get_top(), bl.length() - split);
+	   *  else
+	   *    ::fsync_range(fd, write_pos, bl.length())
+	   *
+	   * NetBSD and AIX apparently have it, and adding it to Linux wouldn't be
+	   * too hard given all the underlying infrastructure already exist.
+	   *
+	   * NOTE: using sync_file_range here would not be safe as it does not
+	   * flush disk caches or commits any sort of metadata.
+	   */
+	  int ret = 0;
 #if defined(DARWIN) || defined(__FreeBSD__)
-    ret = ::fsync(fd);
+	  ret = ::fsync(fd);
 #else
-    ret = ::fdatasync(fd);
+	  ret = ::fdatasync(fd);
 #endif
-    if (ret < 0) {
-      derr << __func__ << " fsync/fdatasync failed: " << cpp_strerror(errno) << dendl;
-      ceph_abort();
-    }
+	  if (ret < 0) {
+		derr << __func__ << " fsync/fdatasync failed: " << cpp_strerror(errno) << dendl;
+		ceph_abort();
+	  }
 #ifdef HAVE_POSIX_FADVISE
-    if (cct->_conf->filestore_fadvise)
-      posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+	  if (cct->_conf->filestore_fadvise)
+		posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
+	}
+
+	utime_t lat = ceph_clock_now() - from;
+	dout(20) << "do_write latency " << lat << dendl;
+
+	write_lock.Lock();
+
+	assert(write_pos == pos);
+	assert(write_pos % header.alignment == 0);
+
+	{
+	  Mutex::Locker locker(finisher_lock);
+	  journaled_seq = writing_seq;
+
+	  // kick finisher?
+	  //  only if we haven't filled up recently!
+	  if (full_state != FULL_NOTFULL) {
+		dout(10) << "do_write NOT queueing finisher seq " << journaled_seq
+		  << ", full_commit_seq|full_restart_seq" << dendl;
+	  } else {
+		if (plug_journal_completions) {
+		  dout(20) << "do_write NOT queueing finishers through seq " << journaled_seq
+			<< " due to completion plug" << dendl;
+		} else {
+		  dout(20) << "do_write queueing finishers through seq " << journaled_seq << dendl;
+		  queue_completions_thru(journaled_seq);
+		}
+	  }
+	}
   }
-
-  utime_t lat = ceph_clock_now() - from;
-  dout(20) << "do_write latency " << lat << dendl;
-
-  write_lock.Lock();
-
-  assert(write_pos == pos);
-  assert(write_pos % header.alignment == 0);
-
-  {
-    Mutex::Locker locker(finisher_lock);
-    journaled_seq = writing_seq;
-
-    // kick finisher?
-    //  only if we haven't filled up recently!
-    if (full_state != FULL_NOTFULL) {
-      dout(10) << "do_write NOT queueing finisher seq " << journaled_seq
-	       << ", full_commit_seq|full_restart_seq" << dendl;
-    } else {
-      if (plug_journal_completions) {
-	dout(20) << "do_write NOT queueing finishers through seq " << journaled_seq
-		 << " due to completion plug" << dendl;
-      } else {
-	dout(20) << "do_write queueing finishers through seq " << journaled_seq << dendl;
-	queue_completions_thru(journaled_seq);
-      }
-    }
-  }
-}
 
 void FileJournal::flush()
 {
@@ -1206,6 +1220,7 @@ void FileJournal::write_thread_entry()
       }
     }
 
+#if 0
 #ifdef HAVE_LIBAIO
     if (aio) {
       Mutex::Locker locker(aio_lock);
@@ -1236,6 +1251,7 @@ void FileJournal::write_thread_entry()
 	dout(20) << "write_thread_entry woke up" << dendl;
       }
     }
+#endif
 #endif
 
     Mutex::Locker locker(write_lock);
@@ -1268,7 +1284,7 @@ void FileJournal::write_thread_entry()
       logger->inc(l_filestore_journal_wr);
       logger->inc(l_filestore_journal_wr_bytes, bl.length());
     }
-
+#if 0
 #ifdef HAVE_LIBAIO
     if (aio)
       do_aio_write(bl);
@@ -1277,12 +1293,16 @@ void FileJournal::write_thread_entry()
 #else
     do_write(bl);
 #endif
+#endif
+//EUNJI 
+	do_write(bl);
     complete_write(orig_ops, orig_bytes);
   }
 
   dout(10) << "write_thread_entry finish" << dendl;
 }
 
+#if 0
 #ifdef HAVE_LIBAIO
 void FileJournal::do_aio_write(bufferlist& bl)
 {
@@ -1436,9 +1456,11 @@ int FileJournal::write_aio_bl(off64_t& pos, bufferlist& bl, uint64_t seq)
   return 0;
 }
 #endif
+#endif
 
 void FileJournal::write_finish_thread_entry()
 {
+#if 0
 #ifdef HAVE_LIBAIO
   dout(10) << "write_finish_thread_entry enter" << dendl;
   while (true) {
@@ -1483,8 +1505,10 @@ void FileJournal::write_finish_thread_entry()
   }
   dout(10) << "write_finish_thread_entry exit" << dendl;
 #endif
+#endif
 }
 
+#if 0
 #ifdef HAVE_LIBAIO
 /**
  * check aio_wait for completed aio, and update state appropriately.
@@ -1534,6 +1558,7 @@ void FileJournal::check_aio_completion()
     aio_cond.Signal();
   }
 }
+#endif
 #endif
 
 int FileJournal::prepare_entry(vector<ObjectStore::Transaction>& tls, bufferlist* tbl) {
@@ -1613,15 +1638,19 @@ void FileJournal::submit_entry(uint64_t seq, bufferlist& e, uint32_t orig_len,
 
   {
     Mutex::Locker l1(writeq_lock);
+#if 0
 #ifdef HAVE_LIBAIO
     Mutex::Locker l2(aio_lock);
 #endif
+#endif
     Mutex::Locker l3(completions_lock);
 
+#if 0
 #ifdef HAVE_LIBAIO
     aio_write_queue_ops++;
     aio_write_queue_bytes += e.length();
     aio_cond.Signal();
+#endif
 #endif
 
     completions.push_back(

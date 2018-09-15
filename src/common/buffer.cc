@@ -2395,45 +2395,45 @@ int buffer::list::write_fd(int fd) const
 
   std::list<ptr>::const_iterator p = _buffers.begin();
   while (p != _buffers.end()) {
-    if (p->length() > 0) {
-      iov[iovlen].iov_base = (void *)p->c_str();
-      iov[iovlen].iov_len = p->length();
-      bytes += p->length();
-      iovlen++;
-    }
-    ++p;
+	if (p->length() > 0) {
+	  iov[iovlen].iov_base = (void *)p->c_str();
+	  iov[iovlen].iov_len = p->length();
+	  bytes += p->length();
+	  iovlen++;
+	}
+	++p;
 
-    if (iovlen == IOV_MAX-1 ||
-	p == _buffers.end()) {
-      iovec *start = iov;
-      int num = iovlen;
-      ssize_t wrote;
-    retry:
-      wrote = ::writev(fd, start, num);
-      if (wrote < 0) {
-	int err = errno;
-	if (err == EINTR)
-	  goto retry;
-	return -err;
-      }
-      if (wrote < bytes) {
-	// partial write, recover!
-	while ((size_t)wrote >= start[0].iov_len) {
-	  wrote -= start[0].iov_len;
-	  bytes -= start[0].iov_len;
-	  start++;
-	  num--;
+	if (iovlen == IOV_MAX-1 ||
+		p == _buffers.end()) {
+	  iovec *start = iov;
+	  int num = iovlen;
+	  ssize_t wrote;
+retry:
+	  wrote = ::writev(fd, start, num);
+	  if (wrote < 0) {
+		int err = errno;
+		if (err == EINTR)
+		  goto retry;
+		return -err;
+	  }
+	  if (wrote < bytes) {
+		// partial write, recover!
+		while ((size_t)wrote >= start[0].iov_len) {
+		  wrote -= start[0].iov_len;
+		  bytes -= start[0].iov_len;
+		  start++;
+		  num--;
+		}
+		if (wrote > 0) {
+		  start[0].iov_len -= wrote;
+		  start[0].iov_base = (char *)start[0].iov_base + wrote;
+		  bytes -= wrote;
+		}
+		goto retry;
+	  }
+	  iovlen = 0;
+	  bytes = 0;
 	}
-	if (wrote > 0) {
-	  start[0].iov_len -= wrote;
-	  start[0].iov_base = (char *)start[0].iov_base + wrote;
-	  bytes -= wrote;
-	}
-	goto retry;
-      }
-      iovlen = 0;
-      bytes = 0;
-    }
   }
   return 0;
 }

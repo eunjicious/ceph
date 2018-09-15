@@ -232,6 +232,8 @@ public:
     list<CollectionRef> removed_collections; ///< colls we removed
 
     CollectionRef first_collection;  ///< first referenced collection
+	// EUNJI 
+	utime_t txc_start;
     utime_t start;
     explicit TransContext(OpSequencer *o)
       : state(STATE_PREPARE),
@@ -241,6 +243,7 @@ public:
 	oncommit(NULL),
 	onreadable(NULL),
 	onreadable_sync(NULL),
+	txc_start(ceph_clock_now()), // EUNJI 
         start(ceph_clock_now()){
       //cout << "txc new " << this << std::endl;
     }
@@ -435,6 +438,10 @@ public:
   int mkjournal() override {
     return 0;
   }
+
+  // EUNJI 
+  void get_db_statistics(Formatter *f) override;
+
   void dump_perf_counters(Formatter *f) override {
     f->open_object_section("perf_counters");
     logger->dump_formatted(f, false);

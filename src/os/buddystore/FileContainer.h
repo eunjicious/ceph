@@ -71,10 +71,11 @@ public:
   bool write_stop;
 
 private:
-  KeyValueDB* free_extent_map_db;
+  KeyValueDB* free_extent_map_db; // <foff, bytes>
   KeyValueDB* oxt_map_db; // ooff, <foff, bytes> 
   string extent_map_backend;
   string extent_map_dir;
+  string free_extent_map_dir;
   //map<string, int> file_map; // fname, fd
 
 public:
@@ -284,7 +285,8 @@ public:
 	write_thread(this), 
 	write_stop(false),
 	extent_map_backend("leveldb"),
-	extent_map_dir(basedir_ + "/cotainer_map"),
+	extent_map_dir(basedir_ + "/container_map"),
+	free_extent_map_dir(basedir_ + "/free_extent_map"),
 	writeq_lock("FC::writeq_lock"),
 	completions_lock("FC::completions_lock"),
 	fc_finisher_lock("FC::finisher_lock"),
