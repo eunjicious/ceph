@@ -362,6 +362,9 @@ static T vec_stddev(vector<T>& v)
 int ObjBencher::fetch_bench_metadata(const std::string& metadata_file,
 				     uint64_t *op_size, uint64_t* object_size,
 				     int* num_objects, int* prevPid) {
+
+  cout << __func__ << " metadata_file " << metadata_file << std::endl;
+
   int r = 0;
   bufferlist object_data;
 
@@ -1102,6 +1105,8 @@ int ObjBencher::clean_up(const std::string& orig_prefix, int concurrentios, cons
   int num_objects;
   int prevPid;
 
+  cout << __func__ << std::endl;
+
   // default meta object if user does not specify one
   const std::string run_name_meta = (run_name.empty() ? BENCH_LASTRUN_METADATA : run_name);
   const std::string prefix = (orig_prefix.empty() ? generate_object_prefix_nopid() : orig_prefix);
@@ -1163,6 +1168,10 @@ int ObjBencher::clean_up(const std::string& orig_prefix, int concurrentios, cons
 
 int ObjBencher::clean_up(int num_objects, int prevPid, int concurrentios) {
   lock_cond lc(&lock);
+
+  cout << __func__ << " num_objects " << num_objects << " prevPid " << prevPid 
+     << " concurrentios " << concurrentios << std::endl; 
+	 
   
   if (concurrentios <= 0) 
     return -EINVAL;
@@ -1298,6 +1307,8 @@ int ObjBencher::clean_up(int num_objects, int prevPid, int concurrentios) {
 int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios, unsigned remove_ratio) {
   lock_cond lc(&lock);
   
+  cout << __func__ << " num_objects " << num_objects << " prevPid " << prevPid 
+     << " concurrentios " << concurrentios << " remove_ratio " << remove_ratio << std::endl;
   if (concurrentios <= 0) 
     return -EINVAL;
 
@@ -1351,6 +1362,8 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
     lock.Unlock();
   }
 
+  cout << " starting to remove objects ... " << std::endl;
+
   //keep on adding new removes as old ones complete
   while (data.started < remove_objects) {
     lock.Lock();
@@ -1402,6 +1415,9 @@ int ObjBencher::clean_up_partial(int num_objects, int prevPid, int concurrentios
     --data.in_flight;
     lock.Unlock();
     release_completion(slot);
+	// EUNJI 
+	if (data.finished % 10 == 0) 
+	  cout << " removed objects = " << data.finished << std::endl;
 
     //start new remove and check data if requested
     create_completion(slot, _aio_cb, (void *)&lc);
@@ -1488,6 +1504,10 @@ bool ObjBencher::more_objects_matching_prefix(const std::string& prefix, std::li
 }
 
 int ObjBencher::clean_up_slow(const std::string& prefix, int concurrentios) {
+
+
+  cout << __func__ << std::endl;
+
   lock_cond lc(&lock);
 
   if (concurrentios <= 0) 

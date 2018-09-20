@@ -182,6 +182,8 @@ public:
   class GenericIteratorImpl {
   public:
     virtual int seek_to_first() = 0;
+//	EUNJI
+	virtual int seek_for_prev(const std::string & to ) = 0;
     virtual int upper_bound(const std::string &after) = 0;
     virtual int lower_bound(const std::string &to) = 0;
     virtual bool valid() = 0;
@@ -238,6 +240,11 @@ public:
     int seek_to_first() override {
       return generic_iter->seek_to_first(prefix);
     }
+// EUNJI 
+	int seek_for_prev (const std::string &to) override {
+	  return generic_iter->seek_for_prev(prefix, to);
+
+	} 
     int seek_to_last() {
       return generic_iter->seek_to_last(prefix);
     }

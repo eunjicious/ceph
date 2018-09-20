@@ -310,6 +310,12 @@ int DBObjectMap::DBObjectMapIteratorImpl::seek_to_first()
   return adjust();
 }
 
+// EUNJI 
+int DBObjectMap::DBObjectMapIteratorImpl::seek_for_prev(const string &to)
+{
+  return 0;
+}
+
 int DBObjectMap::DBObjectMapIteratorImpl::seek_to_last()
 {
   init();

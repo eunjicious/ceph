@@ -364,6 +364,7 @@ private:
   class EmptyIteratorImpl : public ObjectMapIteratorImpl {
   public:
     int seek_to_first() override { return 0; }
+	int seek_for_prev(const string &to) override { return 0; } // EUNJI
     int seek_to_last() { return 0; }
     int upper_bound(const string &after) override { return 0; }
     int lower_bound(const string &to) override { return 0; }
@@ -402,6 +403,7 @@ private:
     DBObjectMapIteratorImpl(DBObjectMap *map, Header header) :
       map(map), hlock(map), header(header), r(0), ready(false), invalid(true) {}
     int seek_to_first() override;
+	int seek_for_prev(const string &to) override;
     int seek_to_last();
     int upper_bound(const string &after) override;
     int lower_bound(const string &to) override;

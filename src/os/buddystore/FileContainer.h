@@ -70,6 +70,26 @@ public:
   } write_thread;
   bool write_stop;
 
+  int do_punch_hole(string fname, uint64_t soff, uint64_t bytes);
+#if 0
+  //-------- free space punch hole thread ---------// 
+  void punch_hole_thread_etnry();
+
+  class PunchHoleThread : public Thread {
+	FileContainer *fc; 
+	public:
+	explicit PunchHoleThread(FileContainer *fc_) : fc(fc_) {}
+	void *entry() override {
+	  fc->punch_hole_thread_entry();
+	  return 0;
+	}
+  } punch_hole_thread;
+  bool force_punch_hole;
+  bool stop_punch_hole;
+  Cond punch_hole_cond;
+  Mutex punch_hole_lock; // for stop, cond 
+#endif
+
 private:
   KeyValueDB* free_extent_map_db; // <foff, bytes>
   KeyValueDB* oxt_map_db; // ooff, <foff, bytes> 
@@ -284,7 +304,7 @@ public:
 	fc_finisher(cct, "BuddyStore", "fn_bd_fc"),
 	write_thread(this), 
 	write_stop(false),
-	extent_map_backend("leveldb"),
+	extent_map_backend("rocksdb"),
 	extent_map_dir(basedir_ + "/container_map"),
 	free_extent_map_dir(basedir_ + "/free_extent_map"),
 	writeq_lock("FC::writeq_lock"),

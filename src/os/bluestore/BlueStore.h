@@ -1355,6 +1355,7 @@ public:
   public:
     OmapIteratorImpl(CollectionRef c, OnodeRef o, KeyValueDB::Iterator it);
     int seek_to_first() override;
+    int seek_for_prev(const string &to) override;
     int upper_bound(const string &after) override;
     int lower_bound(const string &to) override;
     bool valid() override;

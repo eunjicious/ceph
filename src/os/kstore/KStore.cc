@@ -1586,6 +1586,13 @@ int KStore::OmapIteratorImpl::seek_to_first()
   return 0;
 }
 
+// EUNJI 
+int KStore::OmapIteratorImpl::seek_for_prev(const string& to)
+{
+  return 0;
+}
+
+
 int KStore::OmapIteratorImpl::upper_bound(const string& after)
 {
   RWLock::RLocker l(c->lock);

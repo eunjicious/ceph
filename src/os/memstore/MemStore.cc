@@ -636,6 +636,13 @@ public:
     it = o->omap.begin();
     return 0;
   }
+  // EUNJI 
+  int seek_for_prev(const string & to) override {
+	std::lock_guard<std::mutex>(o->omap_mutex);
+    it = o->omap.lower_bound(to);
+    return 0;
+  }
+
   int upper_bound(const string &after) override {
     std::lock_guard<std::mutex>(o->omap_mutex);
     it = o->omap.upper_bound(after);

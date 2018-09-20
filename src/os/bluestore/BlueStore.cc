@@ -6681,6 +6681,18 @@ int BlueStore::OmapIteratorImpl::seek_to_first()
   return 0;
 }
 
+
+int BlueStore::OmapIteratorImpl::seek_for_prev(const string& to)
+{
+  RWLock::RLocker l(c->lock);
+  if (o->onode.has_omap()) {
+    it->lower_bound(head);
+  } else {
+    it = KeyValueDB::Iterator();
+  }
+  return 0;
+}
+
 int BlueStore::OmapIteratorImpl::upper_bound(const string& after)
 {
   RWLock::RLocker l(c->lock);

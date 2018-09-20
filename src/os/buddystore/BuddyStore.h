@@ -288,7 +288,8 @@ private:
 
 #ifdef EUNJI
   string internal_name;
-  string basedir, journalpath;
+  string basedir; 
+  string journalpath;
   osflagbits_t generic_flags;
   uuid_d fsid;
   PerfCounters *logger;

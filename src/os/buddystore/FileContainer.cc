@@ -6,6 +6,8 @@
 #define dout_prefix *_dout << "buddyfc " 
 
 const static int CEPH_DIRECTIO_ALIGNMENT(4096);
+const static int MIN_PUNCH_HOLE_SIZE(8192);
+
 static void append_escaped(const string &in, string *out)
 {
   for (string::const_iterator i = in.begin(); i != in.end(); ++i) {
@@ -22,6 +24,16 @@ static void append_escaped(const string &in, string *out)
       out->push_back(*i);
     }
   }
+}
+
+static string uint64_to_str_key (uint64_t num)
+{
+  uint64_t s = 1;
+  uint64_t n = log10((s << 63) + (s << 63) - 1);
+  string key = to_string(num);
+  while ( n > key.length()) 
+	key = "0" + key;
+  return key;
 }
 
 //----- mkfc -----//
@@ -82,7 +94,7 @@ int FileContainer::_load()
 
 int FileContainer::_create_or_open_file(string fname, int out_flags)
 {
-  dout(3) << __func__ << dendl;
+  dout(3) << __func__ << " fname " << fname << dendl;
 
   // check fd_map 
   auto p = fd_map.find(fname);
@@ -371,6 +383,8 @@ int FileContainer::_alloc_space(coll_t cid, const ghobject_t& oid, const off_t o
 	//string fname = prefix_fn + to_string(file_seq);
 
 	buddy_iov_t* niov = new buddy_iov_t(cid, oid, ooff, curr_tail_off, bytes, file_seq, 0); 
+
+	dout(3) << __func__ << " new alloc " << niov->foff << " : " << niov->bytes << dendl;
 	//buddy_iov_t* niov = new buddy_iov_t(cid, oid, fname, 0, ooff, curr_tail_off, bytes); 
 	iov.push_back(*niov);
 
@@ -399,7 +413,7 @@ int FileContainer::_alloc_space(coll_t cid, const ghobject_t& oid, const off_t o
 int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<buddy_iov_t>& tls_iov) 
 {
 
-  dout(3) << __func__  << " transactions = " << tls.size() << dendl;
+  dout(5) << __func__  << " transactions = " << tls.size() << dendl;
 
   for (vector<ObjectStore::Transaction>::iterator p = tls.begin(); p != tls.end(); ++p) {
 
@@ -421,7 +435,7 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
       int ret = _alloc_space(cid, oid, ooff, bytes, op_iov);
 
       if (ret < 0){
-		dout(3) << "Failed to alloc_space" << dendl;
+		dout(5) << "Failed to alloc_space" << dendl;
 		return -ENOENT;
       }
 
@@ -436,11 +450,11 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 		bufferlist newdata;
 		newdata.append_zero((*ip).foff - (*ip).get_alloc_soff());
 
-		dout(3) << " punch_hole_off " << punch_hole_off << dendl;
-		dout(3) << " data_start_off " << data_start_off << dendl;
-		dout(3) << " foff " << (*ip).foff << dendl;
-		dout(3) << " get_alloc_soff " << (*ip).get_alloc_soff() << dendl;
-		dout(3) << " newdata length " << newdata.length() << dendl;
+		dout(5) << " punch_hole_off " << punch_hole_off << dendl;
+		dout(5) << " data_start_off " << data_start_off << dendl;
+		dout(5) << " foff " << (*ip).foff << dendl;
+		dout(5) << " get_alloc_soff " << (*ip).get_alloc_soff() << dendl;
+		dout(5) << " newdata length " << newdata.length() << dendl;
 		
 		// copy data from transactions' bl 
 		newdata.substr_of(
@@ -448,17 +462,17 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 		  data_start_off + (*ip).src_off, 
 		  (*ip).bytes);
 
-		dout(3) << " newdata length " << newdata.length() << dendl;
+		dout(5) << " newdata length " << newdata.length() << dendl;
 		
 		newdata.append_zero((*ip).get_alloc_bytes() - newdata.length());
 
-		dout(3) << " get_alloc_bytes " << (*ip).get_alloc_bytes() << dendl;
-		dout(3) << " newdata length " << newdata.length() << dendl;
+		dout(5) << " get_alloc_bytes " << (*ip).get_alloc_bytes() << dendl;
+		dout(5) << " newdata length " << newdata.length() << dendl;
 
 		(*ip).data_bl.claim(newdata);
 
 		assert((*ip).get_alloc_bytes() == (*ip).data_bl.length());
-		dout(3) << op_iov << dendl;
+		dout(5) << op_iov << dendl;
 
 #if 0
 		// test
@@ -479,7 +493,7 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 	} // end of punch_hole_ops loop  
   } // end of tls loop
 
-  dout(3) << __func__  << " iov = " << tls_iov.size() << dendl;
+  dout(5) << __func__  << " iov = " << tls_iov.size() << dendl;
   return 0;
 }
 
@@ -753,32 +767,34 @@ int FileContainer::oxt_map_update(vector<buddy_iov_t>& iov)
 
 int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
 {
-  string prefix = iov.cid.to_str(); 
-  string key = ghobject_key(iov.oid);
-  bufferlist bl;
+  string prefix = iov.cid.to_str(); // collection name 
+  string key = ghobject_key(iov.oid); // oid 
 
-  oxt_map_db->get(prefix, key, &bl);
-
-  // overlapped range deletion 
+  // delete an overlapped range with a new extent 
   uint64_t ns = 0, ne = 0, os = 0, oe = 0, ooff, bytes; 
   ooff = iov.ooff;
   bytes = iov.bytes;
 
   // read existing index map 
+  bufferlist bl;
+  oxt_map_db->get(prefix, key, &bl);
   map<uint64_t, buddy_iov_t> omap;  
 
   if(bl.length() == 0){
-	//goto insert_new_index;
+	dout(3) << __func__ << " " << iov << " new index: " << ooff << " : " << iov << dendl;
+	// insert new omap 
 	omap.insert(make_pair(ooff, iov));
 	KeyValueDB::Transaction t = oxt_map_db->get_transaction();
-	::encode(omap, bl); // 여기서는 src_off 까지 같이 되겠지.. 
-	t->set(prefix, key, bl); 
+	bufferlist nbl;
+	::encode(omap, nbl); // 여기서는 src_off 까지 같이 되겠지.. 
+	t->set(prefix, key, nbl); 
 	return oxt_map_db->submit_transaction(t);
   }
 
   // found 
   bufferlist::iterator bp = bl.begin();
   ::decode(omap, bp);
+  dout(3) << __func__ << " " << iov << " has omap with entries " << omap.size() << dendl;
 
   ns = ooff;
   ne = ooff + bytes -1;
@@ -800,7 +816,6 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
   while(p != omap.end()){
 
 	dout(10) << __func__ << " p iov " << p->second << dendl;
-
 	os = p->second.ooff;
 	oe = p->second.ooff + p->second.bytes - 1;
 
@@ -818,57 +833,58 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
 	delete_list.push_back(os);
 
 	if(ns == os && ne == oe) {
-	  dout(10) << __func__ << " full match " << dendl;
+	  dout(3) << __func__ << " full match " << dendl;
 	  break;
 	}
 
-	if(ns > os && ns < oe){
-	  dout(10) << __func__ << " partial right match " << dendl;
-	  prev_idx.bytes -= (oe -ns + 1);
-	  dout(10) << __func__ << " prev_idx " << dendl;
-	  frag_list.push_back(prev_idx);
+	if(ns >= os && ns <= oe){
+	  dout(3) << __func__ << " partial right match " << dendl;
+	  prev_idx.bytes -= (oe - ns + 1);
+	  dout(3) << __func__ << " prev_idx " << prev_idx << dendl;
+	  if(prev_idx.bytes > 0)
+		frag_list.push_back(prev_idx);
 	  //      omap->index_map.insert(make_pair(prev_idx.ooff, prev_idx));
 	}
 
-	if(ne > os && ne < oe) {
-	  dout(10) << __func__ << " partial left match " << dendl;
+	if(ne >= os && ne <= oe) {
+	  dout(3) << __func__ << " partial left match " << dendl;
 	  post_idx.ooff -= (ne - os + 1);
 	  post_idx.foff -= (ne - os + 1);
 	  post_idx.bytes -= (ne - os + 1); 
-	  frag_list.push_back(post_idx);
-	  dout(10) << __func__ << " post_idx " << dendl;
+	  dout(3) << __func__ << " post_idx " << post_idx << dendl;
+	  if(post_idx.bytes > 0)
+		frag_list.push_back(post_idx);
 	  //omap->index_map.insert(make_pair(post_idx.ooff, post_idx));
 	}
-
 	p++;
-
   }
 
   //delete_index:
   for(auto ooff_p = delete_list.begin(); ooff_p != delete_list.end() ; ooff_p++){
-    dout(10) << __func__ << " delete : " << *ooff_p << dendl;
+    dout(3) << __func__ << " delete : " << *ooff_p << dendl;
 
-	// YUIL: add free list 
-	// free extent 로 되는 거니까 이거 달기 <foff,  
-	buddy_iov_t iov;
+	// omap 에 삭제할 object 의 offset 이 있어야 함. 
 	map<uint64_t, buddy_iov_t>::iterator entry_p = omap.find(*ooff_p);
-
 	assert(entry_p != omap.end());
 
-	iov = entry_p->second;
-	dout(10) << __func__ << " iov " << iov << dendl;
+	buddy_iov_t iov = entry_p->second;
 
-	// encode 
+	// free extent map 은 ooff 를 기준으로 sorting 되어야 함. 
+	// 숫자를 string 으로 바로 바꾸니까 100 이 9 보다 앞에 와서 안됨. 
+	// 64bit 에서 가능한 십진수 자리수대로 0000 붙여서 string 만들었음. 
 	string prefix = prefix_fn + to_string(iov.file_seq);
-	string key = to_string(iov.foff);
-	bufferlist bl; 
-	::encode(iov.bytes, bl);
+	string curr_start = uint64_to_str_key(iov.foff);
+	uint64_t curr_end = iov.get_alloc_eoff();
 
+	dout(3) << __func__ << " free_extent_map insert " << prefix << " " << curr_start << " " << curr_end << dendl;
+	bufferlist fbl; 
+	::encode(curr_end, fbl);
 	KeyValueDB::Transaction t = free_extent_map_db->get_transaction();
 	t->set(prefix, key, bl);
 	free_extent_map_db->submit_transaction(t);
 
 	// omap 에서 삭제 
+	dout(3) << __func__ << " delete ooff " << *ooff_p << " from omap " << dendl;
     omap.erase(*ooff_p); // omap 에서는 지움. ooff 가 key 가 됨. 
   }
 
@@ -876,20 +892,46 @@ int FileContainer::oxt_map_single_update(buddy_iov_t& iov)
   for(list<buddy_iov_t>::iterator p = frag_list.begin();
       p != frag_list.end(); p++){
   
-      dout(10) << __func__ << " frag : " << *p << dendl;
+      dout(3) << __func__ << " frag : " << *p << dendl;
+	  auto entry = omap.find((*p).ooff);
+	  assert(entry == omap.end());
       omap.insert(make_pair((*p).ooff, (*p)));
   }
 
-  //insert_new_index:
+#if 0
+  // debug
+  auto dp = omap.find(ooff);
+  assert(dp == omap.end());
+#endif
+
+  dout(3) << __func__ << " insert new index " << ooff << " " << iov << dendl;
   omap.insert(make_pair(ooff, iov));
+#if 0
+  dp = omap.find(ooff);
+  assert(dp->second == iov);
+#endif
+
+  bufferlist nbl;
   KeyValueDB::Transaction t = oxt_map_db->get_transaction();
-  ::encode(omap, bl); // 여기서는 src_off 까지 같이 되겠지.. 
-  t->set(prefix, key, bl); 
-  return oxt_map_db->submit_transaction(t);
+  ::encode(omap, nbl); // 여기서는 src_off 까지 같이 되겠지.. 
+  t->set(prefix, key, nbl); 
+  oxt_map_db->submit_transaction(t);
+
+#if 0
+  // debug 
+  map<uint64_t, buddy_iov_t> domap;  
+  bufferlist dbl;
+  oxt_map_db->get(prefix, key, &dbl);
+  auto dbp = dbl.begin();
+  ::decode(domap, dbp);
+  auto dmp = domap.find(ooff);
+  dout(3) << __func__ << " find iov " << dmp->second << dendl;
+#endif
+
+  return 0;
 
 }
 
-// oxt_map_lookup 
 int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint64_t ooff, uint64_t len, vector<buddy_iov_t>& iov)
 {
   // 실제 이 lookup 함수가 불리는 건 data 를 read 할때.  oxt_map 에 새로운
@@ -912,6 +954,11 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
   }
   auto bp = bl.begin();
   ::decode(omap, bp);
+
+  // debug 
+  for(auto it = omap.begin(); it != omap.end(); ++it) {
+	dout(3) << __func__ << " oxt_map: " << it->second << dendl;
+  }
 
   uint64_t rbytes = len; // remaining bytes 
   uint64_t soff = ooff;
@@ -938,6 +985,7 @@ int FileContainer::oxt_map_lookup(const coll_t& cid, const ghobject_t& oid, uint
 
 	// contiguity check  
 	assert(soff >= p->second.ooff && soff <= (p->second.ooff + p->second.bytes));
+	dout(3) << __func__ << " soff " << p->first << " iov " << p->second << dendl;
 
 	foff = p->second.foff + (soff - p->second.ooff); 
 	peoff = p->second.ooff + p->second.bytes;
@@ -1017,7 +1065,7 @@ int FileContainer::read(const coll_t& cid, const ghobject_t& oid, uint64_t off, 
 //---- remove -----// 
 int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
 {
-  dout(3) << __func__ << dendl;
+  dout(3) << __func__ << " cid " << cid << " oid " << oid << dendl;
   // get oxt map 
   map<uint64_t, buddy_iov_t> omap;  
 
@@ -1035,29 +1083,133 @@ int FileContainer::remove(const coll_t& cid, const ghobject_t& oid)
   bufferlist::iterator bp = bl.begin(); 
   ::decode(omap, bp);
 
-  for (auto p = omap.begin(); p != omap.end(); ++p){
-	  	// encode 
-	string _prefix = prefix_fn + to_string(p->second.file_seq);
-	string _key = to_string(p->second.foff);
 
-	bufferlist _bl; 
-	::encode(p->second.bytes, _bl);
+  KeyValueDB::Transaction t = free_extent_map_db->get_transaction();
+  string curr_prefix(""), curr_key("");
 
-	KeyValueDB::Transaction t = free_extent_map_db->get_transaction();
-	t->set(_prefix, _key, _bl);
-	free_extent_map_db->submit_transaction(t);
+
+  dout(3) << __func__ << " omap size = " << omap.size() << dendl;
+  for (map<uint64_t, buddy_iov_t>::iterator p = omap.begin(); p != omap.end(); ++p)
+  {
+
+	// check merge possible  
+	uint64_t curr_start = p->second.get_alloc_soff(); // 지울 애들 
+	uint64_t curr_end = p->second.get_alloc_eoff(); // 
+
+	curr_prefix = prefix_fn + to_string(p->second.file_seq);
+	curr_key = uint64_to_str_key(curr_start);
+
+	dout(3) << __func__ << " curr_start " << curr_start << " curr_end " << curr_end 
+	  << " curr_prefix " << curr_prefix << " curr_key " << curr_key << dendl;
+
+	uint64_t prev_start, prev_end, next_start, next_end;
+
+	// 앞에 꺼랑 merge 될 수 있는지 확인. 
+	KeyValueDB::Iterator iter = free_extent_map_db->get_iterator(curr_prefix);
+	
+	int ret = iter->seek_for_prev(curr_key);  // ok 면 ret 값이 0 임.
+	
+	if(iter->valid()) {
+	  assert(ret == 0);
+
+	  pair<string, string> prev_full_key = iter->raw_key();
+	  prev_start = std::stoull(prev_full_key.second);
+	  bufferlist prev_bl = iter->value(); 
+	  bufferlist::iterator bp = prev_bl.begin();
+	  ::decode(prev_end, bp);
+
+	  dout(3) << __func__ << " prev: prev_start " << prev_start << " prev_end " << prev_end << dendl;
+	  assert(prev_start <= curr_start);
+
+	  if(prev_end >= curr_start) {
+		curr_end = prev_end > curr_end ? prev_end : curr_end;	
+		curr_start = prev_start;
+		curr_key = to_string(curr_start);
+		// 여긴 원래거 지울 필요 없음. key 가 같으니까. 
+	  }
+	}
+#if 0 
+	// 뒤에꺼랑 합칠 수 있는지 확인. 만약 가능하다면 뒤의 것은 삭제해야 함. 
+	for(iter->upper_bound(curr_key); iter->valid(); iter->next())
+	{
+	  pair<string, string> next_full_key = iter->raw_key();
+	  assert(next_full_key.first == curr_prefix);
+
+	  next_start = std::stoull(next_full_key.second);
+	  bufferlist next_bl = iter->value(); 
+	  bufferlist::iterator bp = next_bl.begin();
+	  ::decode(next_end, bp);
+
+	  dout(3) << __func__ << " next_start " << next_start << " next_end " << next_end << dendl;
+	  assert(next_start > curr_start); 
+
+	  if(curr_end < next_start) 
+		break;
+
+	  curr_end = next_end > curr_end ? next_end : curr_end;	
+	  t->rmkey(next_full_key.first, next_full_key.second);
+		// 여기는 원래 key 지워야 함. 
+	}
+
+#endif
+	if ((curr_end - curr_start) >= MIN_PUNCH_HOLE_SIZE){
+	  do_punch_hole(curr_prefix, curr_start, curr_end - curr_start);
+	} else { 
+	  dout(3) << __func__ << " tr: prefix " << curr_prefix << " curr_key " << curr_key << " curr_end " << curr_end << " curr_start " << curr_start << dendl;
+	  bufferlist bl; 
+	  ::encode(curr_end, bl);
+	  t->set(curr_prefix, curr_key, bl);
+	}
+	//t->set(curr_prefix, curr_key, bbl);
+  } // end of omap 
+
+  int r = free_extent_map_db->submit_transaction(t);
+  if (r < 0) {
+	dout(3) << __func__ << " Failed to insert entry into free extent map " << dendl;
+	assert(0);
   }
 
+#if 0
+  // debug 
+  int count = 0;
+  KeyValueDB::Iterator it = free_extent_map_db->get_iterator(curr_prefix);
+  for (it->seek_to_first(); it->valid(); it->next()){
+	count++;
+	pair<string, string> full_key = it->raw_key();
+	dout(3) << __func__ << " free_extent_map: prefix " << full_key.first << " offset " << full_key.second << dendl;
+	if(full_key.first != curr_prefix)
+	  break;
+  }
+  dout(3) << __func__ << " free_extent_map entries : " << count << dendl;
 
-  // 삭제 
-  if(oxt_map_db){
-	KeyValueDB::Transaction t = oxt_map_db->get_transaction(); 
+  it->lower_bound(curr_key);
+  if(it->valid()){
+	pair<string, string> prev_full_key = it->raw_key();
+	dout(3) << __func__ << " lower_bound result = prefix " << prev_full_key.first << " key " << prev_full_key.second << dendl;
 
+  } else {
+	dout(3) << __func__ << " lower_bound is not valid " << dendl;
+  }	
+#endif
+
+
+  // object extent map update 
+  //if(oxt_map_db){
+	//KeyValueDB::Transaction 
+	t = oxt_map_db->get_transaction(); 
 	t->rmkey(prefix, key);	
+	r = oxt_map_db->submit_transaction(t);
+	if (r < 0) {
+	  dout(3) << __func__ << "Failed to submit_transaction " << dendl;
+	}
 
+	// debug 
+	bufferlist dbl;
+	oxt_map_db->get(prefix, key, &dbl);
+  	assert(dbl.length() == 0);
 
-
-  }
+	dout(3) << __func__ << " Succed to remove key " << prefix << " " << key << dendl;
+  //}
   return 0;
 }
 
@@ -1080,5 +1232,67 @@ int FileContainer::truncate(const coll_t& cid, const ghobject_t& oid, uint64_t b
   return 0;
 };
 
+int FileContainer::do_punch_hole(string fname, uint64_t soff, uint64_t bytes)
+{
+  dout(3) << __func__ << " fname " << fname << " soff " << soff << " bytes " << bytes << dendl;
 
+  int fd = _create_or_open_file(fname, O_RDWR); // flags 
+  if (fd < 0) {
+	dout(1) << __func__ << " Failed to open file" << dendl;
+	return fd;
+  }
 
+  int ret = fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE, soff, bytes);
+  if (ret < 0 ){
+      dout(1) << __func__ << " failed to punch_hole " << dendl;
+  }
+  return ret;
+}
+
+#if 0
+//----- punch_hole_thread_entry -----//
+void FileContainer::punch_hole_thread_entry()
+{
+
+  dout(3) << "fc punch_hole_thread_entry start" << dendl;
+  utime_t lat;
+  utime_t start;
+
+  punch_hole_lock.Lock();
+
+  utime_t interval;
+  interval.set_from_double(30.0);
+
+  while (!stop_punch_hole) {
+    utime_t startwait = ceph_clock_now();
+
+    if (!force_punch_hole) {
+      dout(10) << __func__ << " waiting for interval " <<  interval << dendl;
+      punch_hole_cond.WaitInterval(punch_hole_lock, interval);
+    }
+    if (force_punch_hole) {
+      dout(10) << __func__ << " force_punch_hole " << dendl;
+      force_punch_hole = false;
+    }
+    if (stop_punch_hole) {
+      dout(10) << __func__ << " stop punch_hole_thread " << dendl;
+      break;
+
+    } else {
+      utime_t woke = ceph_clock_now();
+      woke -= startwait;
+      dout(10) << __func__ << " woke up after " << woke << dendl;
+    }
+
+    punch_hole_lock.Unlock();
+
+	// do_punch_hole 
+
+  }
+
+  stop_punch_hole = false;
+  punch_hole_lock.Unlock();
+
+  dout(3) << __func__ << " terminate " << dendl;
+}
+#endif
