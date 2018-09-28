@@ -10,6 +10,36 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "journal "
 
+#ifdef recovery
+int BDJournalingObjectStore::data_read(string fname, buddy_iov_t& iov){
+  int flags= O_RDONLY; 
+  int fd = ::open(fname.c_str(), flags, 444);
+
+  if (fd < 0){
+    dout(3) << __func__ << " [recovery]Failed to create file" << fname << cpp_strerror(fd) << dendl;
+    return fd;
+  }
+
+  bufferlist ebl;
+  ebl.rebuild_aligned(4096);
+
+  uint64_t boff = iov.get_alloc_soff();
+  uint64_t blen = iov.get_alloc_bytes();
+  uint64_t foff = iov.foff;
+  uint64_t len = iov.bytes;
+ 
+  int ret = ebl.read_fd(fd, boff, blen);
+  assert(ret > 0);
+  iov.data_bl.substr_of(ebl, foff-boff, len);
+
+  if (ret < static_cast<int>(len))
+    dout(10) << __func__ << " [recovery]Read less " << cpp_strerror(ret) << dendl;
+
+  close(fd);    
+
+  return ret;
+}
+#endif
 
 
 void BDJournalingObjectStore::journal_start()
@@ -87,11 +117,37 @@ int BDJournalingObjectStore::journal_replay(uint64_t fs_op_seq)
     bufferlist::iterator p = bl.begin();
     vector<ObjectStore::Transaction> tls;
     while (!p.end()) {
+#ifdef recovery
+      uint32_t off=0;
+      uint8_t flag=0;
+      Transaction tr = Transaction(p,flag);
+      dout(1) << " [JESEONG] Journal Recovery " << dendl;
+      bufferlist newdata;
+      for(vector<Transaction::Op>::iterator op_p = tr.punch_hole_ops.begin(); op_p != tr.punch_hole_ops.end(); ++op_p){
+	uint32_t punch_hole_off=op_p->punch_hole_off;
+	auto punch_hole_map_p = tr.punch_hole_map.find(punch_hole_off);
+	auto iov_iter = punch_hole_map_p->second;	
+
+    	for(auto iov_p= iov_iter.begin(); iov_p != iov_iter.end(); ++iov_p){
+	  buddy_iov_t buddy_io;
+	  buddy_io.foff=iov_p->foff;
+	  buddy_io.bytes=iov_p->bytes;
+	  int ret = data_read(iov_p->fname, buddy_io); 
+	  assert(ret > 0);
+	  
+	  newdata.substr_of(buddy_io.data_bl, 0, iov_p->bytes);
+	}
+	off+=sizeof(__u32);
+      }
+      tr.data_bl.claim(newdata);
+      tls.emplace_back(tr);
+#else
       tls.emplace_back(Transaction(p));
+#endif
     }
 
     apply_manager.op_apply_start(seq);
-    //int r = do_transactions(tls, seq);
+    int r = do_transactions(tls, seq);
     dout(10) << "Skipping do_transactions seq " << seq << dendl;
     apply_manager.op_apply_finish(seq);
 

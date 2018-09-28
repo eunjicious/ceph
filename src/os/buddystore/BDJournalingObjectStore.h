@@ -21,6 +21,10 @@
 #include "common/RWLock.h"
 #include "osd/OpRequest.h"
 
+#ifdef recovery
+#include "buddy_types.h"
+#endif
+
 class BDJournalingObjectStore : public ObjectStore {
 protected:
   BDJournal *journal;
@@ -147,6 +151,9 @@ public:
 
   ~BDJournalingObjectStore() override {
   }
+#ifdef recovery
+    int data_read(string fname, buddy_iov_t& iov);
+#endif
 };
 
 #endif

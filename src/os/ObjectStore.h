@@ -35,6 +35,7 @@
 
 #define OPS_PER_PTR 32
 
+//#define recovery
 class CephContext;
 
 using std::vector;
@@ -528,11 +529,29 @@ public:
       //uint64_t tot_bytes;
       
       void encode(bufferlist& bl) const {
+#ifdef recovery
+	ENCODE_START(9,9, bl);
+	::encode(fname, bl);
+	::encode(ooff, bl);
+	::encode(foff, bl);
+	::encode(bytes, bl);
+	ENCODE_FINISH(bl);
+#else
         bl.append((char*)this, sizeof(iov_t));
+#endif
       }
 
       void decode(bufferlist::iterator& bl){
+#ifdef recovery
+	DECODE_START(9,bl);
+	::decode(fname, bl);
+	::decode(ooff, bl);
+	::decode(foff, bl);
+	::decode(bytes, bl);
+	DECODE_FINISH(bl);
+#else
         bl.copy(sizeof(iov_t), (char*)this);
+#endif
       }
 
       iov_t(const string& fname_, uint64_t ooff_, uint64_t foff_, uint64_t bytes_ ) : 
@@ -555,6 +574,11 @@ public:
   public:
     Transaction() = default;
 
+#ifdef recovery
+    explicit Transaction(bufferlist::iterator &dp, uint8_t flag){
+      decode_punch_hole(dp);
+    }
+#endif
     explicit Transaction(bufferlist::iterator &dp) {
       decode(dp);
     }
@@ -1539,18 +1563,13 @@ public:
 	  ::encode(punch_hole_map, bl);
 
 	  uint32_t coff = 0;
+	  bufferlist log_data;
 	  for(vector<Op>::const_iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); iter++)
 	  {	
-		bufferlist log_data;
-		log_data.substr_of(data_bl, coff, (*iter).punch_hole_off - coff);
-
-		::encode_destructively(log_data, bl);
+		log_data.substr_of(data_bl, coff, sizeof(__u32));
 		coff += ((*iter).len + sizeof(__u32));	
 	  }
-	  bufferlist log_data;
-	  log_data.substr_of(data_bl, coff, data_bl.length() - coff);
-	  ::encode_destructively(log_data, bl);
-
+	  ::encode(log_data, bl);
 	  ::encode(op_bl, bl);
 	  ::encode(coll_index, bl);
 	  ::encode(object_index, bl);
@@ -1565,19 +1584,7 @@ public:
 	  //::decode(data_bl, bl);
 	  ::decode(punch_hole_ops, bl);
 	  ::decode(punch_hole_map, bl);
-
-	  for(vector<Op>::iterator iter = punch_hole_ops.begin(); iter != punch_hole_ops.end(); ++iter)
-	  {	
-		::decode(data_bl, bl);
-
-		// fill out punch 
-		// hole 은 zero 를 만들어서 붙이든가 해야함.. 
-		// 여기서 원래는 punch_hole_map 보고 해당하는 file 읽어와서 replay 해야함. 
-		// 일단은 zero 로 두자. 
-		data_bl.append_zero((*iter).len);
-	  }
 	  ::decode(data_bl, bl);
-
 	  ::decode(op_bl, bl);
 	  ::decode(coll_index, bl);
 	  ::decode(object_index, bl);

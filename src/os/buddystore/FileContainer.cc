@@ -487,9 +487,11 @@ int FileContainer::prepare_write(vector<ObjectStore::Transaction> &tls, vector<b
 	  
 	  // tls_iov 는 실제 write_thread 가 file 에 io 할 때 쓰는 정보임. 
 	  tls_iov.insert(tls_iov.end(), op_iov.begin(), op_iov.end());
-
+#ifdef recovery
+	  punch_hole_map_update(*p, punch_hole_off, op_iov);
+#else
 	  punch_hole_map_update(tr, punch_hole_off, op_iov);
-
+#endif
 	} // end of punch_hole_ops loop  
   } // end of tls loop
 

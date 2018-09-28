@@ -428,9 +428,12 @@ private:
     ThreadPool::TPHandle *handle);
 
   int do_transactions(vector<Transaction> &tls, uint64_t op_seq) override {
-    return 0;
+#ifdef recovery
     // 이거는 journal_replay 손볼때 같이 고쳐야 함. 
-    //return _do_transactions(tls, op_seq, 0);
+    return _do_transactions(tls, op_seq, 0);
+#else
+    return 0;
+#endif
   }
 
   // C_JournalCompletion -> _finish_journal -> ondisk 
